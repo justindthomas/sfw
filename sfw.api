@@ -1,0 +1,15 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later
+ * Copyright (c) 2026 Justin Thomas
+ */
+
+option version = "1.0.0";
+import "vnet/interface_types.api";
+
+/** Enable or disable sfw on an interface (both ip4 and ip6) */
+autoreply define sfw_enable_disable {
+    u32 client_index;
+    u32 context;
+    bool enable_disable;
+    vl_api_interface_index_t sw_if_index;
+    option vat_help = "<intfc> [disable]";
+};
