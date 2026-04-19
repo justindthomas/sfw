@@ -178,10 +178,11 @@ sfw_resolve_dst_zone4 (sfw_main_t *sm, u32 sw_if_index,
     }
   else if (dpo->dpoi_type == DPO_RECEIVE)
     {
-      /* Traffic to the router's own address — get the owning interface */
-      receive_dpo_t *rd = receive_dpo_get (dpo->dpoi_index);
-      if (rd->rd_sw_if_index < vec_len (sm->if_config))
-	return sm->if_config[rd->rd_sw_if_index].zone_id;
+      /* Traffic destined for one of the router's own addresses.
+       * Map to the built-in "local" zone so operators can write
+       * cross-zone policies (e.g., external->local) that gate
+       * traffic terminated on the router itself. */
+      return SFW_ZONE_LOCAL;
     }
 
   return SFW_ZONE_NONE;
@@ -209,9 +210,9 @@ sfw_resolve_dst_zone6 (sfw_main_t *sm, u32 sw_if_index,
     }
   else if (dpo->dpoi_type == DPO_RECEIVE)
     {
-      receive_dpo_t *rd = receive_dpo_get (dpo->dpoi_index);
-      if (rd->rd_sw_if_index < vec_len (sm->if_config))
-	return sm->if_config[rd->rd_sw_if_index].zone_id;
+      /* Traffic destined for one of the router's own addresses — map
+       * to the built-in "local" zone.  See sfw_resolve_dst_zone4. */
+      return SFW_ZONE_LOCAL;
     }
 
   return SFW_ZONE_NONE;
@@ -251,6 +252,7 @@ typedef struct
   u8 icmp_type;
   u8 icmp_code;
   u8 nat_computed; /* 0=none, 1=SNAT, 2=DNAT */
+  u8 nat_mode;	   /* sfw_nat_mode_t — set during pass 1 NAT translation */
 } sfw_pkt_meta_t;
 
 always_inline uword
@@ -505,7 +507,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  if (sfw_nat_translate_source (
 		sm, thread_index, &ip0->src_address, m->src_port,
 		m->protocol, &ip0->dst_address, &m->nat_addr,
-		&m->nat_port) == 0)
+		&m->nat_port, &m->nat_mode) == 0)
 	    {
 	      if (m->protocol == IP_PROTOCOL_ICMP)
 		m->nat_port = m->src_port;
@@ -607,75 +609,81 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  continue;
 		}
 
-	      /* Check for NATted key collision. Deterministic NAT can map
-	       * different source ports to the same external port via modulo.
-	       * If the computed port is in use, scan forward through the
-	       * host's port range for a free slot. */
-	      {
-		clib_bihash_kv_48_8_t ck = { 0 }, cr = { 0 };
-		sfw_key4_t *ckey = (sfw_key4_t *) &ck.key;
-		u16 nat_port_h = clib_net_to_host_u16 (m->nat_port);
-		/* Determine port range for this host from the pool */
-		u16 port_base = nat_port_h -
-				(nat_port_h % 1); /* will recalc below */
-		u8 found_free = 0;
+	      /* Deterministic NAT collision check.  Deterministic NAT maps
+	       * source ports via modulo, so different source ports can
+	       * compute the same external port.  Scan the host's port range
+	       * for a free slot.  Dynamic NAT uses per-thread bitmap
+	       * allocation which prevents collisions by design. */
+	      if (m->nat_mode == SFW_NAT_MODE_DETERMINISTIC)
+		{
+		  u8 found_free = 0;
+		  u16 nat_port_h = clib_net_to_host_u16 (m->nat_port);
 
-		/* Find the pool to get ports_per_host and port_base */
-		for (u32 pi = 0; pi < vec_len (sm->nat_pools); pi++)
-		  {
-		    sfw_nat_pool_t *pool = &sm->nat_pools[pi];
-		    if (pool->mode != SFW_NAT_MODE_DETERMINISTIC)
+		  /* Find the deterministic pool that produced this
+		   * translation */
+		  for (u32 pi = 0; pi < vec_len (sm->nat_pools); pi++)
+		    {
+		      sfw_nat_pool_t *pool = &sm->nat_pools[pi];
+		      if (pool->mode != SFW_NAT_MODE_DETERMINISTIC)
+			continue;
+
+		      u32 mask =
+			pool->external_plen ?
+			  clib_host_to_net_u32 (
+			    ~0u << (32 - pool->external_plen)) :
+			  0;
+		      if ((m->nat_addr.as_u32 & mask) !=
+			  (pool->external_addr.as_u32 & mask))
+			continue;
+
+		      u32 int_idx = sfw_ip4_addr_index (
+			&ip0->src_address, &pool->internal_addr,
+			pool->internal_plen);
+		      if (int_idx >= pool->n_internal_addrs)
+			continue;
+
+		      u32 hpe =
+			pool->n_internal_addrs / pool->n_external_addrs;
+		      if (hpe == 0)
+			hpe = 1;
+		      u32 host_off = int_idx % hpe;
+		      u16 port_base = pool->port_range_start +
+				      (host_off * pool->ports_per_host);
+
+		      for (u16 p = 0; p < pool->ports_per_host; p++)
+			{
+			  u16 try_port =
+			    port_base + ((nat_port_h - port_base + p) %
+					 pool->ports_per_host);
+			  clib_bihash_kv_48_8_t ck = { 0 }, cr = { 0 };
+			  sfw_key4_t *ckey = (sfw_key4_t *) &ck.key;
+			  ckey->src = ip0->dst_address;
+			  ckey->dst = m->nat_addr;
+			  ckey->src_port = m->dst_port;
+			  ckey->dst_port = clib_host_to_net_u16 (try_port);
+			  ckey->protocol = m->protocol;
+			  if (clib_bihash_search_48_8 (&sm->session_hash,
+						       &ck, &cr) != 0)
+			    {
+			      m->nat_port =
+				clib_host_to_net_u16 (try_port);
+			      found_free = 1;
+			      break;
+			    }
+			}
+		      break;
+		    }
+
+		  if (!found_free)
+		    {
+		      nexts[i] = SFW_NEXT_DROP;
+		      bufs[i]->error =
+			node->errors[SFW_ERROR_NAT_EXHAUSTED];
+		      nat_exhausted++;
+		      denied++;
 		      continue;
-		    if (m->nat_addr.as_u32 != pool->external_addr.as_u32 &&
-			pool->n_external_addrs == 1)
-		      continue;
-
-		    u32 int_idx = sfw_ip4_addr_index (
-		      &ip0->src_address, &pool->internal_addr,
-		      pool->internal_plen);
-		    if (int_idx >= pool->n_internal_addrs)
-		      continue;
-
-		    u32 hpe = pool->n_internal_addrs / pool->n_external_addrs;
-		    if (hpe == 0)
-		      hpe = 1;
-		    u32 host_off = int_idx % hpe;
-		    port_base =
-		      pool->port_range_start + (host_off * pool->ports_per_host);
-
-		    /* Try each port in this host's range */
-		    for (u16 p = 0; p < pool->ports_per_host; p++)
-		      {
-			u16 try_port = port_base + ((nat_port_h - port_base +
-						     p) %
-						    pool->ports_per_host);
-			clib_memset (&ck, 0, sizeof (ck));
-			ckey = (sfw_key4_t *) &ck.key;
-			ckey->src = ip0->dst_address;
-			ckey->dst = m->nat_addr;
-			ckey->src_port = m->dst_port;
-			ckey->dst_port = clib_host_to_net_u16 (try_port);
-			ckey->protocol = m->protocol;
-			if (clib_bihash_search_48_8 (&sm->session_hash, &ck,
-						     &cr) != 0)
-			  {
-			    m->nat_port = clib_host_to_net_u16 (try_port);
-			    found_free = 1;
-			    break;
-			  }
-		      }
-		    break; /* found the matching pool */
-		  }
-
-		if (!found_free)
-		  {
-		    nexts[i] = SFW_NEXT_DROP;
-		    bufs[i]->error = node->errors[SFW_ERROR_NAT_EXHAUSTED];
-		    nat_exhausted++;
-		    denied++;
-		    continue;
-		  }
-	      }
+		    }
+		}
 
 	      sfw_session_t *s = sfw_session_create (sm, thread_index, now);
 	      if (PREDICT_TRUE (s != 0))

@@ -153,7 +153,7 @@ int
 sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
 			  ip4_address_t *src_addr, u16 src_port, u8 protocol,
 			  ip4_address_t *dst_addr, ip4_address_t *out_addr,
-			  u16 *out_port)
+			  u16 *out_port, u8 *out_mode)
 {
   u32 i;
 
@@ -191,6 +191,7 @@ sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
       if ((clib_net_to_host_u32 (dst_addr->as_u32) >> 28) == 0xE)
 	return -1;
 
+      *out_mode = pool->mode;
       switch (pool->mode)
 	{
 	case SFW_NAT_MODE_DETERMINISTIC:

@@ -31,10 +31,18 @@ sfw_feature_init (sfw_main_t *sm)
   vec_validate (sm->pending_free, nworkers);
   vec_validate_init_empty (sm->clear_requested, nworkers, 0);
 
-  /* Initialize zone structures */
+  /* Initialize zone structures.
+   * Zone 0 is reserved (SFW_ZONE_NONE).
+   * Zone 1 is the built-in "local" zone: the sfw node synthesizes this
+   * zone_id as the destination for any packet whose FIB lookup returns
+   * DPO_RECEIVE, so operators can write policies like external->local
+   * to gate traffic destined for the router itself. */
   clib_memset (sm->zones, 0, sizeof (sm->zones));
   clib_memset (sm->zone_pairs, 0, sizeof (sm->zone_pairs));
-  sm->n_zones = 1; /* zone 0 is reserved (SFW_ZONE_NONE) */
+  strncpy (sm->zones[SFW_ZONE_LOCAL].name, "local",
+	   sizeof (sm->zones[SFW_ZONE_LOCAL].name) - 1);
+  sm->zones[SFW_ZONE_LOCAL].zone_id = SFW_ZONE_LOCAL;
+  sm->n_zones = 2;
 
   sm->initialized = 1;
 }
@@ -173,11 +181,21 @@ sfw_zone_command_fn (vlib_main_t *vm, unformat_input_t *input,
       return clib_error_return (0, "expected 'interface <name>'");
     }
 
+  /* 'local' is a built-in zone owned by the plugin; don't let it be
+   * assigned to a physical interface. */
+  if (strcmp (zone_name, "local") == 0)
+    {
+      vec_free (zone_name);
+      return clib_error_return (
+	0, "'local' is a reserved built-in zone and cannot be assigned to "
+	   "an interface");
+    }
+
   u32 zone_id = sfw_zone_find_or_create (sm, zone_name);
   vec_free (zone_name);
 
   if (zone_id == SFW_ZONE_NONE)
-    return clib_error_return (0, "too many zones (max %u)", SFW_MAX_ZONES - 1);
+    return clib_error_return (0, "too many zones (max %u)", SFW_MAX_ZONES - 2);
 
   vec_validate_init_empty (sm->if_config, sw_if_index, (sfw_if_config_t){ 0 });
   sm->if_config[sw_if_index].zone_id = zone_id;
@@ -423,6 +441,18 @@ sfw_policy_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (have_rule)
     {
+      /* Workers read p->rules during packet processing.  Use a worker
+       * barrier to prevent use-after-free from vec reallocation —
+       * but only after VPP has fully started.  During unix { exec }
+       * at startup, the barrier deadlocks because workers aren't
+       * yet responding to barrier requests.  The exec runs single-
+       * threaded on the main thread, so no synchronization is needed
+       * at that point anyway. */
+      u8 need_barrier = (vlib_num_workers () > 0 &&
+			  vlib_get_main ()->main_loop_count > 0);
+      if (need_barrier)
+	vlib_worker_thread_barrier_sync (vm);
+
       if (delete_rule)
 	{
 	  if (rule_position < vec_len (p->rules))
@@ -446,13 +476,18 @@ sfw_policy_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	  rule.icmp_type = icmp_type;
 	  rule.icmp_code = icmp_code;
 
-	  /* Insert at position (or append) */
+	  /* Insert at position or append if beyond current length */
 	  if (rule_position >= vec_len (p->rules))
 	    vec_add1 (p->rules, rule);
 	  else
-	    vec_insert (p->rules, 1, rule_position);
-	  p->rules[rule_position] = rule;
+	    {
+	      vec_insert (p->rules, 1, rule_position);
+	      p->rules[rule_position] = rule;
+	    }
 	}
+
+      if (need_barrier)
+	vlib_worker_thread_barrier_release (vm);
     }
 
   return 0;
@@ -975,11 +1010,26 @@ sfw_show_nat_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	  format_ip4_address, &p->internal_addr, p->internal_plen,
 	  mode_names[p->mode], p->ports_per_host);
       else
-	vlib_cli_output (vm, "  [%u] %U/%u -> %U/%u mode %s", i,
-			 format_ip4_address, &p->external_addr,
-			 p->external_plen, format_ip4_address,
-			 &p->internal_addr, p->internal_plen,
-			 mode_names[p->mode]);
+	{
+	  vlib_cli_output (vm, "  [%u] %U/%u -> %U/%u mode %s", i,
+			   format_ip4_address, &p->external_addr,
+			   p->external_plen, format_ip4_address,
+			   &p->internal_addr, p->internal_plen,
+			   mode_names[p->mode]);
+	  if (p->port_bitmaps)
+	    {
+	      u32 t;
+	      for (t = 0; t < vec_len (p->thread_port_count); t++)
+		vlib_cli_output (vm,
+				 "    thread %u: port_start=%u count=%u "
+				 "bitmaps=%s",
+				 t, p->thread_port_start[t],
+				 p->thread_port_count[t],
+				 p->port_bitmaps[t] ? "allocated" : "NULL");
+	    }
+	  else
+	    vlib_cli_output (vm, "    port_bitmaps: NOT ALLOCATED");
+	}
     }
 
   vlib_cli_output (vm, "\nDNAT static mappings: %u",

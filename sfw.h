@@ -183,7 +183,8 @@ typedef struct
 /* --- Zones --- */
 
 #define SFW_ZONE_NONE	    0	/* unassigned / unknown zone */
-#define SFW_MAX_ZONES	    16	/* max zones (zone_id 1..15, 0=none) */
+#define SFW_ZONE_LOCAL	    1	/* built-in: traffic to/from the router itself */
+#define SFW_MAX_ZONES	    16	/* max zones (zone_id 2..15, 0=none, 1=local) */
 
 /* Zone definition */
 typedef struct
@@ -423,7 +424,8 @@ int sfw_session_insert_hash (sfw_main_t *sm, sfw_session_t *s, u64 enc,
 int sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
 			      ip4_address_t *src_addr, u16 src_port,
 			      u8 protocol, ip4_address_t *dst_addr,
-			      ip4_address_t *out_addr, u16 *out_port);
+			      ip4_address_t *out_addr, u16 *out_port,
+			      u8 *out_mode);
 sfw_nat_static_t *sfw_nat_find_dnat (sfw_main_t *sm,
 				      ip4_address_t *dst_addr, u16 dst_port,
 				      u8 protocol);
