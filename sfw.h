@@ -407,6 +407,19 @@ extern vlib_node_registration_t sfw_ip6_node;
 
 void sfw_feature_init (sfw_main_t *sm);
 
+/* Enable or disable the sfw feature arc on a single interface. */
+int sfw_enable_disable_interface (sfw_main_t *sm, u32 sw_if_index, int enable);
+
+/* Zone helpers. Zone 0 is SFW_ZONE_NONE; zone 1 is the built-in
+ * "local". find_or_create returns an existing zone id if the name
+ * is already known, or a freshly allocated one. Returns
+ * SFW_ZONE_NONE when the table is full. */
+u32 sfw_zone_find_by_name (sfw_main_t *sm, const char *name);
+u32 sfw_zone_find_or_create (sfw_main_t *sm, const char *name);
+
+/* API message handlers hookup (see sfw_api.c). */
+clib_error_t *sfw_plugin_api_hookup (vlib_main_t *vm);
+
 /* Rule matching */
 sfw_action_t sfw_match_rules (sfw_rule_t *rules, u32 n_rules,
 			      u8 default_action, u8 is_ip6,

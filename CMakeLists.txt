@@ -4,6 +4,7 @@
 add_vpp_plugin(sfw
   SOURCES
   sfw.c
+  sfw_api.c
   sfw_node.c
   sfw_rules.c
   sfw_session.c

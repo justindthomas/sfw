@@ -2,14 +2,29 @@
  * Copyright (c) 2026 Justin Thomas
  */
 
-option version = "1.0.0";
+option version = "1.1.0";
 import "vnet/interface_types.api";
 
-/** Enable or disable sfw on an interface (both ip4 and ip6) */
-autoreply define sfw_enable_disable {
-    u32 client_index;
-    u32 context;
-    bool enable_disable;
-    vl_api_interface_index_t sw_if_index;
-    option vat_help = "<intfc> [disable]";
+/** Enable or disable sfw on an interface (both ip4 and ip6). */
+autoreply define sfw_enable_disable
+{
+  u32 client_index;
+  u32 context;
+  bool enable_disable;
+  vl_api_interface_index_t sw_if_index;
+  option vat_help = "<intfc> [disable]";
+};
+
+/** Add or remove an interface from a named zone. The zone is
+ * created on first use (sfw_zone_find_or_create) when is_add=true.
+ * On is_add=false the interface is removed from its current zone
+ * (no-op if it wasn't in one).
+ */
+autoreply define sfw_zone_interface_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_interface_index_t sw_if_index;
+  string zone_name[32];
 };

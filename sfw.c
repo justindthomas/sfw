@@ -49,7 +49,7 @@ sfw_feature_init (sfw_main_t *sm)
 
 /* --- Per-interface feature enable/disable --- */
 
-static int
+int
 sfw_enable_disable_interface (sfw_main_t *sm, u32 sw_if_index,
 			      int enable_disable)
 {
@@ -78,7 +78,7 @@ sfw_enable_disable_interface (sfw_main_t *sm, u32 sw_if_index,
 
 /* --- Zone management helpers --- */
 
-static u32
+u32
 sfw_zone_find_by_name (sfw_main_t *sm, const char *name)
 {
   u32 i;
@@ -103,7 +103,7 @@ sfw_zone_create (sfw_main_t *sm, const char *name)
   return id;
 }
 
-static u32
+u32
 sfw_zone_find_or_create (sfw_main_t *sm, const char *name)
 {
   u32 id = sfw_zone_find_by_name (sm, name);
@@ -1182,6 +1182,11 @@ sfw_init (vlib_main_t *vm)
   sm->max_sessions_per_worker = 100000;
   sm->hash_buckets = 64 << 10; /* 64K */
   sm->hash_memory = 256ULL << 20; /* 256 MB */
+
+  /* Wire up the binary API handlers defined in sfw_api.c. */
+  clib_error_t *err = sfw_plugin_api_hookup (vm);
+  if (err)
+    return err;
 
   return 0;
 }
