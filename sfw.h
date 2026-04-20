@@ -417,6 +417,15 @@ int sfw_enable_disable_interface (sfw_main_t *sm, u32 sw_if_index, int enable);
 u32 sfw_zone_find_by_name (sfw_main_t *sm, const char *name);
 u32 sfw_zone_find_or_create (sfw_main_t *sm, const char *name);
 
+/* Policy helpers. sfw_policy_create wires the new policy into the
+ * zone-pair table and enables the feature arc on every interface
+ * that falls in from_zone or to_zone. sfw_policy_delete is the
+ * inverse: detach from zone-pair, free rules + the policy struct. */
+sfw_policy_t *sfw_policy_find (sfw_main_t *sm, const char *name);
+sfw_policy_t *sfw_policy_create (sfw_main_t *sm, const char *name,
+				 u32 from_zone_id, u32 to_zone_id);
+void sfw_policy_delete (sfw_main_t *sm, sfw_policy_t *p);
+
 /* API message handlers hookup (see sfw_api.c). */
 clib_error_t *sfw_plugin_api_hookup (vlib_main_t *vm);
 

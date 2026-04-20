@@ -2,8 +2,9 @@
  * Copyright (c) 2026 Justin Thomas
  */
 
-option version = "1.1.0";
+option version = "1.2.0";
 import "vnet/interface_types.api";
+import "vnet/ip/ip_types.api";
 
 /** Enable or disable sfw on an interface (both ip4 and ip6). */
 autoreply define sfw_enable_disable
@@ -27,4 +28,107 @@ autoreply define sfw_zone_interface_add_del
   bool is_add;
   vl_api_interface_index_t sw_if_index;
   string zone_name[32];
+};
+
+/** Create or delete a policy.
+ *
+ * On is_add=true: creates a new policy with the given zones and
+ * default action. The policy is wired into the zone-pair table
+ * and the feature arc is enabled on every interface already in
+ * either zone. Zones are created if they don't already exist.
+ * Returns an error if a policy with the same name already exists.
+ *
+ * On is_add=false: detaches the policy from the zone-pair table,
+ * frees its rules, and removes it. Only policy_name is consulted.
+ *
+ * default_action values: 0=deny 1=permit 2=permit-stateful
+ *                        3=permit-stateful-nat
+ */
+autoreply define sfw_policy_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  string policy_name[64];
+  string from_zone[32];
+  string to_zone[32];
+  u8 default_action;
+  /* 1 = auto-permit NDP / PMTUD / echo (the plugin default) */
+  bool implicit_icmpv6;
+};
+
+/** Insert or remove a rule within a policy.
+ *
+ * rule_index is the 0-based position in the policy's rule vector.
+ * On add, the new rule is inserted at that position (existing
+ * entries pushed down). If rule_index >= current length the rule
+ * is appended.
+ *
+ * On delete only policy_name and rule_index are consulted.
+ *
+ * action values match sfw_action_t (see sfw_policy_add_del).
+ * address_family: 0=any 1=ip4 2=ip6. Protocol 0 means "any";
+ * icmp_type/icmp_code 255 means "any".
+ */
+autoreply define sfw_policy_rule_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  string policy_name[64];
+  u32 rule_index;
+  u8 action;
+  u8 address_family;
+  vl_api_prefix_t src_prefix;
+  vl_api_prefix_t dst_prefix;
+  u8 protocol;
+  u16 src_port_lo;
+  u16 src_port_hi;
+  u16 dst_port_lo;
+  u16 dst_port_hi;
+  u8 icmp_type;
+  u8 icmp_code;
+};
+
+/** Create or delete a NAT pool (IPv4 only in the current plugin).
+ *
+ * external_prefix / internal_prefix are vl_api_prefix_t (so the
+ * wire encoding matches other VPP APIs) but must be IPv4 — the
+ * handler rejects IPv6 for now. mode is sfw_nat_mode_t:
+ *   0 = deterministic
+ *   1 = dynamic
+ *
+ * On delete the pool whose (external_prefix, internal_prefix)
+ * pair matches exactly is removed; `mode` is ignored on delete.
+ */
+autoreply define sfw_nat_pool_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_prefix_t external_prefix;
+  vl_api_prefix_t internal_prefix;
+  u8 mode;
+};
+
+/** Create or delete a static (DNAT) mapping.
+ *
+ * protocol = 0 means 1:1 IP-level mapping (no port translation);
+ * nonzero is TCP (6) / UDP (17) with explicit ports. Addresses are
+ * vl_api_address_t on the wire but must resolve to IPv4 — the
+ * plugin's NAT path is IPv4-only today.
+ *
+ * On delete the mapping matching (external_address, protocol,
+ * external_port) is removed.
+ */
+autoreply define sfw_nat_static_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_address_t external_address;
+  vl_api_address_t internal_address;
+  u8 protocol;
+  u16 external_port;
+  u16 internal_port;
 };

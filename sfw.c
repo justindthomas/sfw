@@ -114,7 +114,7 @@ sfw_zone_find_or_create (sfw_main_t *sm, const char *name)
 
 /* --- Policy management helpers --- */
 
-static sfw_policy_t *
+sfw_policy_t *
 sfw_policy_find (sfw_main_t *sm, const char *name)
 {
   u32 i;
@@ -126,7 +126,7 @@ sfw_policy_find (sfw_main_t *sm, const char *name)
   return 0;
 }
 
-static sfw_policy_t *
+sfw_policy_t *
 sfw_policy_create (sfw_main_t *sm, const char *name, u32 from_zone_id,
 		   u32 to_zone_id)
 {
@@ -157,6 +157,44 @@ sfw_policy_create (sfw_main_t *sm, const char *name, u32 from_zone_id,
     }
 
   return p;
+}
+
+void
+sfw_policy_delete (sfw_main_t *sm, sfw_policy_t *p)
+{
+  if (!p)
+    return;
+
+  /* Detach from zone-pair table */
+  u32 zp_index = p->from_zone_id * SFW_MAX_ZONES + p->to_zone_id;
+  if (sm->zone_pairs[zp_index].policy == p)
+    sm->zone_pairs[zp_index].policy = 0;
+
+  /* Under workers, rule vec reads need to be serialized with a
+   * barrier before the backing storage disappears. Only sync if
+   * workers are running and VPP is past boot. */
+  u8 need_barrier = (vlib_num_workers () > 0 &&
+		      vlib_get_main ()->main_loop_count > 0);
+  if (need_barrier)
+    vlib_worker_thread_barrier_sync (sm->vlib_main);
+
+  vec_free (p->rules);
+
+  /* Remove from policies vector */
+  u32 i;
+  for (i = 0; i < vec_len (sm->policies); i++)
+    {
+      if (sm->policies[i] == p)
+	{
+	  sm->policies[i] = 0;
+	  break;
+	}
+    }
+
+  if (need_barrier)
+    vlib_worker_thread_barrier_release (sm->vlib_main);
+
+  clib_mem_free (p);
 }
 
 /* --- CLI: sfw zone --- */
@@ -522,25 +560,7 @@ sfw_no_policy_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (!p)
     return clib_error_return (0, "policy not found");
 
-  /* Remove from zone-pair table */
-  u32 zp_index = p->from_zone_id * SFW_MAX_ZONES + p->to_zone_id;
-  sm->zone_pairs[zp_index].policy = 0;
-
-  /* Free rule vec and policy */
-  vec_free (p->rules);
-
-  /* Remove from policies vector */
-  u32 i;
-  for (i = 0; i < vec_len (sm->policies); i++)
-    {
-      if (sm->policies[i] == p)
-	{
-	  sm->policies[i] = 0;
-	  break;
-	}
-    }
-
-  clib_mem_free (p);
+  sfw_policy_delete (sm, p);
   return 0;
 }
 
