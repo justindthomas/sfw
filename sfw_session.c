@@ -5,6 +5,8 @@
 /* sfw_session.c - session create/delete/lookup/timeout helpers */
 
 #include <sfw/sfw.h>
+#include <vlib/vlib.h>
+#include <vlib/threads.h>
 
 sfw_session_t *
 sfw_session_create (sfw_main_t *sm, u32 thread_index, f64 now)
@@ -235,3 +237,66 @@ format_sfw_session (u8 *s, va_list *args)
   s = format (s, "\n");
   return s;
 }
+
+/* --- Periodic session expiry process ---
+ *
+ * sfw_expire_inline is called per-frame from each worker's sfw_ip4/ip6
+ * nodes. If a worker stops seeing sfw-covered packets (e.g. multi-queue
+ * NIC steers broadcast/ARP/NDP to one queue and the RSS-hashed IP flows
+ * that created sessions on that worker go silent), nothing drives the
+ * expiry walk — sessions with expired TTLs sit in the pool indefinitely.
+ *
+ * This process node runs on the main thread, wakes every
+ * SFW_EXPIRE_INTERVAL seconds, takes the worker barrier, and sweeps
+ * every per-worker pool. With the barrier held no worker is running
+ * sfw packet paths, so reusing sfw_expire_inline on each thread_index
+ * is safe: we're the only writer of sessions[ti] / lru_tail[ti] /
+ * pending_free[ti] for the duration.
+ *
+ * SFW_EXPIRE_INTERVAL is deliberately coarse (several seconds) — the
+ * per-frame expiry path still runs under traffic and does the heavy
+ * lifting. This is a backstop for the idle-worker case, not the hot
+ * path. Barrier hold time is O(expired sessions across all workers),
+ * which for a home router is microseconds; upping the interval keeps
+ * it that way.
+ */
+
+#define SFW_EXPIRE_INTERVAL 5.0
+
+static uword
+sfw_expire_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
+		    vlib_frame_t *f)
+{
+  sfw_main_t *sm = &sfw_main;
+
+  while (1)
+    {
+      vlib_process_wait_for_event_or_clock (vm, SFW_EXPIRE_INTERVAL);
+      /* Drain any posted events — we don't use them today, we only
+       * care about the periodic wake-up. */
+      vlib_process_get_events (vm, 0);
+
+      if (!sm->initialized)
+	continue;
+
+      f64 now = vlib_time_now (vm);
+      u32 n_slots = vec_len (sm->sessions);
+      if (n_slots == 0)
+	continue;
+
+      vlib_worker_thread_barrier_sync (vm);
+      /* sm->sessions is vec_validate'd to `nworkers` in sfw_feature_init,
+       * giving slots [0 .. nworkers] (main + each worker). Iterate all
+       * slots so we cover workers whose packet path has gone idle. */
+      for (u32 ti = 0; ti < n_slots; ti++)
+	sfw_expire_inline (sm, ti, now);
+      vlib_worker_thread_barrier_release (vm);
+    }
+  return 0;
+}
+
+VLIB_REGISTER_NODE (sfw_expire_process_node) = {
+  .function = sfw_expire_process,
+  .type = VLIB_NODE_TYPE_PROCESS,
+  .name = "sfw-expire-process",
+};
