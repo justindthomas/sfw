@@ -46,6 +46,8 @@ format_sfw_trace (u8 *s, va_list *args)
 
 vlib_node_registration_t sfw_ip4_node;
 vlib_node_registration_t sfw_ip6_node;
+vlib_node_registration_t sfw_ip4_output_node;
+vlib_node_registration_t sfw_ip6_output_node;
 
 #endif /* CLIB_MARCH_VARIANT */
 
@@ -56,7 +58,8 @@ vlib_node_registration_t sfw_ip6_node;
   _ (DENIED, "sfw packets denied")                                            \
   _ (PERMITTED, "sfw packets permitted (stateless)")                          \
   _ (NAT_TRANSLATED, "sfw NAT translations")                                 \
-  _ (NAT_EXHAUSTED, "sfw NAT port exhaustion drops")
+  _ (NAT_EXHAUSTED, "sfw NAT port exhaustion drops")                          \
+  _ (LOCAL_ORIGINATED, "sfw locally-originated flows (ip*-output)")
 
 typedef enum
 {
@@ -224,6 +227,33 @@ sfw_zone_pair_policy (sfw_main_t *sm, u32 src_zone, u32 dst_zone)
 {
   u32 idx = src_zone * SFW_MAX_ZONES + dst_zone;
   return sm->zone_pairs[idx].policy;
+}
+
+/* True if the given src address is configured on this router — used on
+ * the ip4-output feature arc to detect locally-originated traffic (VPP
+ * self-generated ICMP, VCL apps, host-stack daemons). */
+static inline int
+sfw_is_local_src4 (u32 sw_if_index, ip4_address_t *src_addr)
+{
+  if (sw_if_index >= vec_len (ip4_main.fib_index_by_sw_if_index))
+    return 0;
+  u32 fib_index = vec_elt (ip4_main.fib_index_by_sw_if_index, sw_if_index);
+  index_t lbi = ip4_fib_forwarding_lookup (fib_index, src_addr);
+  const load_balance_t *lb = load_balance_get (lbi);
+  const dpo_id_t *dpo = load_balance_get_bucket_i (lb, 0);
+  return dpo->dpoi_type == DPO_RECEIVE;
+}
+
+static inline int
+sfw_is_local_src6 (u32 sw_if_index, ip6_address_t *src_addr)
+{
+  if (sw_if_index >= vec_len (ip6_main.fib_index_by_sw_if_index))
+    return 0;
+  u32 fib_index = vec_elt (ip6_main.fib_index_by_sw_if_index, sw_if_index);
+  index_t lbi = ip6_fib_table_fwding_lookup (fib_index, src_addr);
+  const load_balance_t *lb = load_balance_get (lbi);
+  const dpo_id_t *dpo = load_balance_get_bucket_i (lb, 0);
+  return dpo->dpoi_type == DPO_RECEIVE;
 }
 
 /* --- IPv4 node (two-pass design) ---
@@ -1118,6 +1148,600 @@ VLIB_NODE_FN (sfw_ip6_node)
     return sfw_ip6_inline (vm, node, frame, 0);
 }
 
+/* --- IPv4 output arc (sfw-ip4-out) ---
+ *
+ * Catches traffic the input arc never sees: VPP self-generated replies
+ * (ICMP, TCP RST-to-unknown), VCL apps, and any other locally-originated
+ * packets.  Synthesizes src_zone = SFW_ZONE_LOCAL when the source address
+ * is configured on this router (FIB DPO_RECEIVE), then applies the
+ * (local, dst_zone) zone-pair policy and creates a session so the return
+ * traffic finds a matching entry on the input arc.
+ *
+ * Forwarded traffic (input arc → lookup → rewrite → here) also traverses
+ * this node.  A session hash lookup catches those cases and we simply
+ * pass through — no second session gets created. */
+
+typedef struct
+{
+  sfw_session_t *session;
+  sfw_policy_t *policy;
+  u16 src_port;
+  u16 dst_port;
+  u8 action;
+  u8 protocol;
+  u8 icmp_type;
+  u8 icmp_code;
+  u8 is_local_src;
+} sfw_out_meta_t;
+
+always_inline uword
+sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+		       vlib_frame_t *frame, int is_trace)
+{
+  u32 *from, n_vectors;
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE];
+  u16 nexts[VLIB_FRAME_SIZE];
+  sfw_main_t *sm = &sfw_main;
+  f64 now = vlib_time_now (vm);
+  u32 thread_index = vm->thread_index;
+  u32 created = 0, hits = 0, denied = 0, permitted = 0, local_originated = 0;
+  sfw_out_meta_t meta[VLIB_FRAME_SIZE];
+  u32 i;
+
+  from = vlib_frame_vector_args (frame);
+  n_vectors = frame->n_vectors;
+  vlib_get_buffers (vm, from, bufs, n_vectors);
+
+  for (i = 0; i < n_vectors; i++)
+    {
+      u32 next0;
+      vnet_feature_next (&next0, bufs[i]);
+      nexts[i] = next0;
+    }
+
+  /* Pass 1: lookup + classify (no bihash adds) */
+  for (i = 0; i < n_vectors; i++)
+    {
+      sfw_out_meta_t *m = &meta[i];
+      clib_memset (m, 0, sizeof (*m));
+      m->action = SFW_ACTION_PERMIT;
+
+      /* On ip4-output, ip4-rewrite has already prepended the L2 rewrite
+       * and advanced current_data backward by save_rewrite_length bytes.
+       * The IP header lives past that offset. */
+      u32 rw_len = vnet_buffer (bufs[i])->ip.save_rewrite_length;
+      ip4_header_t *ip0 =
+	(ip4_header_t *) ((u8 *) vlib_buffer_get_current (bufs[i]) + rw_len);
+      u32 tx_sw_if_index = vnet_buffer (bufs[i])->sw_if_index[VLIB_TX];
+
+      u32 dst_h = clib_net_to_host_u32 (ip0->dst_address.as_u32);
+      u32 src_h = clib_net_to_host_u32 (ip0->src_address.as_u32);
+      if (PREDICT_FALSE (dst_h == 0xFFFFFFFF || src_h == 0 ||
+			 (dst_h >> 28) == 0xE))
+	{
+	  permitted++;
+	  continue;
+	}
+
+      m->protocol = ip0->protocol;
+
+      u16 ip_len = clib_net_to_host_u16 (ip0->length);
+      u16 ihl = (ip0->ip_version_and_header_length & 0x0F) << 2;
+      u16 buf_len = vlib_buffer_length_in_chain (vm, bufs[i]);
+      if (PREDICT_FALSE (ihl < sizeof (ip4_header_t) ||
+			 ip_len < ihl + 4 || buf_len < ihl + 4))
+	{
+	  permitted++;
+	  continue;
+	}
+
+      void *l4_hdr = ip4_next_header (ip0);
+      sfw_extract_l4 (m->protocol, l4_hdr, &m->src_port, &m->dst_port,
+		      &m->icmp_type, &m->icmp_code);
+
+      /* Session lookup — matches both forwarded traffic (session created
+       * on input arc) and local-originated retransmits. */
+      clib_bihash_kv_48_8_t kv = { 0 }, result = { 0 };
+      sfw_key4_t *key;
+      u8 found_session = 0;
+      u8 is_from_zone = 1;
+
+      key = (sfw_key4_t *) &kv.key;
+      key->src = ip0->dst_address;
+      key->dst = ip0->src_address;
+      key->src_port = m->dst_port;
+      key->dst_port = m->src_port;
+      key->protocol = m->protocol;
+
+      if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
+	{
+	  found_session = 1;
+	  is_from_zone = 1;
+	}
+      else
+	{
+	  clib_memset (&kv, 0, sizeof (kv));
+	  key = (sfw_key4_t *) &kv.key;
+	  key->src = ip0->src_address;
+	  key->dst = ip0->dst_address;
+	  key->src_port = m->src_port;
+	  key->dst_port = m->dst_port;
+	  key->protocol = m->protocol;
+	  if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
+	    {
+	      found_session = 1;
+	      is_from_zone = 0;
+	    }
+	}
+
+      if (found_session)
+	{
+	  u32 st = sfw_session_thread (result.value);
+	  u32 si = sfw_session_index (result.value);
+	  m->session = pool_elt_at_index (sm->sessions[st], si);
+
+	  if (PREDICT_TRUE (!m->session->tcp_rst &&
+			    !(m->session->tcp_fin_fwd &&
+			      m->session->tcp_fin_rev)))
+	    {
+	      if (st == thread_index)
+		sfw_lru_touch (sm, m->session, now);
+	      else
+		m->session->expires = now + sm->session_timeout;
+	    }
+
+	  hits++;
+	  m->action = SFW_ACTION_PERMIT;
+
+	  if (m->protocol == IP_PROTOCOL_TCP)
+	    {
+	      tcp_header_t *tcp = (tcp_header_t *) l4_hdr;
+	      u8 flags = tcp->flags;
+	      if (PREDICT_FALSE (flags & TCP_FLAG_RST))
+		{
+		  m->session->tcp_rst = 1;
+		  m->session->expires = now + SFW_TCP_CLOSE_TIMEOUT;
+		}
+	      else if (PREDICT_FALSE (flags & TCP_FLAG_FIN))
+		{
+		  if (is_from_zone)
+		    m->session->tcp_fin_fwd = 1;
+		  else
+		    m->session->tcp_fin_rev = 1;
+		  if (m->session->tcp_fin_fwd && m->session->tcp_fin_rev)
+		    m->session->expires = now + SFW_TCP_CLOSE_TIMEOUT;
+		}
+	    }
+	  continue;
+	}
+
+      /* No session — is this a locally-originated new flow?
+       * The FIB DPO_RECEIVE check identifies any src configured on this
+       * router (on any interface, any FIB).  If it isn't local, the
+       * packet was merely transiting and either hit a stateless
+       * permit on the input arc or wasn't zoned — either way, pass. */
+      if (!sfw_is_local_src4 (tx_sw_if_index, &ip0->src_address))
+	continue;
+      m->is_local_src = 1;
+
+      if (tx_sw_if_index >= vec_len (sm->if_config))
+	continue;
+      u32 dst_zone = sm->if_config[tx_sw_if_index].zone_id;
+      if (dst_zone == SFW_ZONE_NONE)
+	continue;
+
+      sfw_policy_t *policy =
+	sfw_zone_pair_policy (sm, SFW_ZONE_LOCAL, dst_zone);
+      if (PREDICT_FALSE (!policy))
+	continue;
+
+      m->policy = policy;
+
+      ip46_address_t src46 = { 0 }, dst46 = { 0 };
+      src46.ip4 = ip0->src_address;
+      dst46.ip4 = ip0->dst_address;
+      m->action = sfw_match_rules (
+	policy->rules, vec_len (policy->rules), policy->default_action, 0,
+	&src46, &dst46, m->protocol, clib_net_to_host_u16 (m->src_port),
+	clib_net_to_host_u16 (m->dst_port), m->icmp_type, m->icmp_code);
+    }
+
+  /* Pass 2: create sessions for locally-originated new flows */
+  for (i = 0; i < n_vectors; i++)
+    {
+      sfw_out_meta_t *m = &meta[i];
+      u32 rw_len = vnet_buffer (bufs[i])->ip.save_rewrite_length;
+      ip4_header_t *ip0 =
+	(ip4_header_t *) ((u8 *) vlib_buffer_get_current (bufs[i]) + rw_len);
+
+      if (m->action == SFW_ACTION_DENY)
+	{
+	  nexts[i] = SFW_NEXT_DROP;
+	  bufs[i]->error = node->errors[SFW_ERROR_DENIED];
+	  denied++;
+	}
+      else if (m->action == SFW_ACTION_PERMIT)
+	{
+	  if (!m->session && m->is_local_src)
+	    permitted++;
+	}
+      else if ((m->action == SFW_ACTION_PERMIT_STATEFUL ||
+		m->action == SFW_ACTION_PERMIT_STATEFUL_NAT) &&
+	       !m->session && m->is_local_src)
+	{
+	  /* Cross-frame re-check: a prior frame on another worker may
+	   * have just inserted a session for this flow. */
+	  clib_bihash_kv_48_8_t gk = { 0 }, gr = { 0 };
+	  sfw_key4_t *gkey = (sfw_key4_t *) &gk.key;
+	  gkey->src = ip0->dst_address;
+	  gkey->dst = ip0->src_address;
+	  gkey->src_port = m->dst_port;
+	  gkey->dst_port = m->src_port;
+	  gkey->protocol = m->protocol;
+	  if (clib_bihash_search_48_8 (&sm->session_hash, &gk, &gr) == 0)
+	    {
+	      hits++;
+	      continue;
+	    }
+
+	  sfw_session_t *s = sfw_session_create (sm, thread_index, now);
+	  if (PREDICT_TRUE (s != 0))
+	    {
+	      s->is_ip6 = 0;
+	      s->nat_type = SFW_NAT_NONE;
+	      s->has_nat_key = 1;
+	      s->k4.src = ip0->dst_address;
+	      s->k4.dst = ip0->src_address;
+	      s->k4.src_port = m->dst_port;
+	      s->k4.dst_port = m->src_port;
+	      s->k4.protocol = m->protocol;
+
+	      u64 enc = sfw_session_encode (
+		thread_index, s - sm->sessions[thread_index]);
+
+	      clib_bihash_kv_48_8_t kv1, kv2;
+	      clib_memset (&kv1, 0, sizeof (kv1));
+	      clib_memcpy_fast (&kv1.key, &s->k4, sizeof (sfw_key4_t));
+	      kv1.value = enc;
+
+	      clib_memset (&kv2, 0, sizeof (kv2));
+	      sfw_key4_t *dk = (sfw_key4_t *) &kv2.key;
+	      dk->src = ip0->src_address;
+	      dk->dst = ip0->dst_address;
+	      dk->src_port = m->src_port;
+	      dk->dst_port = m->dst_port;
+	      dk->protocol = m->protocol;
+	      kv2.value = enc;
+
+	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
+		{
+		  created++;
+		  local_originated++;
+		}
+	    }
+	}
+
+      if (is_trace && (bufs[i]->flags & VLIB_BUFFER_IS_TRACED))
+	{
+	  sfw_trace_t *t = vlib_add_trace (vm, node, bufs[i], sizeof (*t));
+	  t->sw_if_index = vnet_buffer (bufs[i])->sw_if_index[VLIB_TX];
+	  t->next_index = nexts[i];
+	  t->action = m->action;
+	  t->session_found = (m->session != 0);
+	  t->protocol = m->protocol;
+	  t->nat_applied = 0;
+	}
+    }
+
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, n_vectors);
+  sfw_expire_inline (sm, thread_index, now);
+
+  vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_PROCESSED,
+			       n_vectors);
+  vlib_node_increment_counter (vm, node->node_index,
+			       SFW_ERROR_SESSIONS_CREATED, created);
+  vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_SESSION_HITS,
+			       hits);
+  vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_DENIED,
+			       denied);
+  vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_PERMITTED,
+			       permitted);
+  vlib_node_increment_counter (vm, node->node_index,
+			       SFW_ERROR_LOCAL_ORIGINATED, local_originated);
+  return n_vectors;
+}
+
+VLIB_NODE_FN (sfw_ip4_output_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  if (PREDICT_FALSE (node->flags & VLIB_NODE_FLAG_TRACE))
+    return sfw_ip4_output_inline (vm, node, frame, 1);
+  else
+    return sfw_ip4_output_inline (vm, node, frame, 0);
+}
+
+/* --- IPv6 output arc (sfw-ip6-out) --- */
+
+always_inline uword
+sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
+		       vlib_frame_t *frame, int is_trace)
+{
+  u32 *from, n_vectors;
+  vlib_buffer_t *bufs[VLIB_FRAME_SIZE];
+  u16 nexts[VLIB_FRAME_SIZE];
+  sfw_main_t *sm = &sfw_main;
+  f64 now = vlib_time_now (vm);
+  u32 thread_index = vm->thread_index;
+  u32 created = 0, hits = 0, denied = 0, permitted = 0, local_originated = 0;
+  sfw_out_meta_t meta[VLIB_FRAME_SIZE];
+  u32 i;
+
+  from = vlib_frame_vector_args (frame);
+  n_vectors = frame->n_vectors;
+  vlib_get_buffers (vm, from, bufs, n_vectors);
+
+  for (i = 0; i < n_vectors; i++)
+    {
+      u32 next0;
+      vnet_feature_next (&next0, bufs[i]);
+      nexts[i] = next0;
+    }
+
+  /* Pass 1 */
+  for (i = 0; i < n_vectors; i++)
+    {
+      sfw_out_meta_t *m = &meta[i];
+      clib_memset (m, 0, sizeof (*m));
+      m->action = SFW_ACTION_PERMIT;
+
+      /* See IPv4 output: IP header lives past the saved rewrite length. */
+      u32 rw_len = vnet_buffer (bufs[i])->ip.save_rewrite_length;
+      ip6_header_t *ip0 =
+	(ip6_header_t *) ((u8 *) vlib_buffer_get_current (bufs[i]) + rw_len);
+      u32 tx_sw_if_index = vnet_buffer (bufs[i])->sw_if_index[VLIB_TX];
+
+      if (PREDICT_FALSE (
+	    ip6_address_is_link_local_unicast (&ip0->src_address) ||
+	    ip6_address_is_link_local_unicast (&ip0->dst_address)))
+	{
+	  permitted++;
+	  continue;
+	}
+
+      m->protocol = ip0->protocol;
+
+      u16 ip6_plen = clib_net_to_host_u16 (ip0->payload_length);
+      u16 buf_len = vlib_buffer_length_in_chain (vm, bufs[i]);
+      if (PREDICT_FALSE (ip6_plen < 4 ||
+			 buf_len < sizeof (ip6_header_t) + 4))
+	{
+	  permitted++;
+	  continue;
+	}
+
+      void *l4_hdr = ip6_next_header (ip0);
+      sfw_extract_l4 (m->protocol, l4_hdr, &m->src_port, &m->dst_port,
+		      &m->icmp_type, &m->icmp_code);
+
+      clib_bihash_kv_48_8_t kv = { 0 }, result = { 0 };
+      sfw_key6_t *key;
+      u8 found_session = 0;
+      u8 is_from_zone = 1;
+
+      key = (sfw_key6_t *) &kv.key;
+      ip6_address_copy (&key->src, &ip0->dst_address);
+      ip6_address_copy (&key->dst, &ip0->src_address);
+      key->src_port = m->dst_port;
+      key->dst_port = m->src_port;
+      key->protocol = m->protocol;
+
+      if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
+	{
+	  found_session = 1;
+	  is_from_zone = 1;
+	}
+      else
+	{
+	  clib_memset (&kv, 0, sizeof (kv));
+	  key = (sfw_key6_t *) &kv.key;
+	  ip6_address_copy (&key->src, &ip0->src_address);
+	  ip6_address_copy (&key->dst, &ip0->dst_address);
+	  key->src_port = m->src_port;
+	  key->dst_port = m->dst_port;
+	  key->protocol = m->protocol;
+	  if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
+	    {
+	      found_session = 1;
+	      is_from_zone = 0;
+	    }
+	}
+
+      if (found_session)
+	{
+	  u32 st = sfw_session_thread (result.value);
+	  u32 si = sfw_session_index (result.value);
+	  m->session = pool_elt_at_index (sm->sessions[st], si);
+
+	  if (PREDICT_TRUE (!m->session->tcp_rst &&
+			    !(m->session->tcp_fin_fwd &&
+			      m->session->tcp_fin_rev)))
+	    {
+	      if (st == thread_index)
+		sfw_lru_touch (sm, m->session, now);
+	      else
+		m->session->expires = now + sm->session_timeout;
+	    }
+
+	  hits++;
+	  m->action = SFW_ACTION_PERMIT;
+
+	  if (m->protocol == IP_PROTOCOL_TCP)
+	    {
+	      tcp_header_t *tcp = (tcp_header_t *) l4_hdr;
+	      u8 flags = tcp->flags;
+	      if (PREDICT_FALSE (flags & TCP_FLAG_RST))
+		{
+		  m->session->tcp_rst = 1;
+		  m->session->expires = now + SFW_TCP_CLOSE_TIMEOUT;
+		}
+	      else if (PREDICT_FALSE (flags & TCP_FLAG_FIN))
+		{
+		  if (is_from_zone)
+		    m->session->tcp_fin_fwd = 1;
+		  else
+		    m->session->tcp_fin_rev = 1;
+		  if (m->session->tcp_fin_fwd && m->session->tcp_fin_rev)
+		    m->session->expires = now + SFW_TCP_CLOSE_TIMEOUT;
+		}
+	    }
+	  continue;
+	}
+
+      if (!sfw_is_local_src6 (tx_sw_if_index, &ip0->src_address))
+	continue;
+      m->is_local_src = 1;
+
+      if (tx_sw_if_index >= vec_len (sm->if_config))
+	continue;
+      u32 dst_zone = sm->if_config[tx_sw_if_index].zone_id;
+      if (dst_zone == SFW_ZONE_NONE)
+	continue;
+
+      sfw_policy_t *policy =
+	sfw_zone_pair_policy (sm, SFW_ZONE_LOCAL, dst_zone);
+      if (PREDICT_FALSE (!policy))
+	continue;
+
+      m->policy = policy;
+
+      if (m->protocol == IP_PROTOCOL_ICMP6 && policy->implicit_icmpv6 &&
+	  sfw_is_implicit_icmpv6 (m->icmp_type))
+	{
+	  permitted++;
+	  continue;
+	}
+
+      ip46_address_t src46 = { 0 }, dst46 = { 0 };
+      ip6_address_copy (&src46.ip6, &ip0->src_address);
+      ip6_address_copy (&dst46.ip6, &ip0->dst_address);
+      m->action = sfw_match_rules (
+	policy->rules, vec_len (policy->rules), policy->default_action, 1,
+	&src46, &dst46, m->protocol, clib_net_to_host_u16 (m->src_port),
+	clib_net_to_host_u16 (m->dst_port), m->icmp_type, m->icmp_code);
+    }
+
+  /* Pass 2 */
+  for (i = 0; i < n_vectors; i++)
+    {
+      sfw_out_meta_t *m = &meta[i];
+      u32 rw_len = vnet_buffer (bufs[i])->ip.save_rewrite_length;
+      ip6_header_t *ip0 =
+	(ip6_header_t *) ((u8 *) vlib_buffer_get_current (bufs[i]) + rw_len);
+
+      if (m->action == SFW_ACTION_DENY)
+	{
+	  nexts[i] = SFW_NEXT_DROP;
+	  bufs[i]->error = node->errors[SFW_ERROR_DENIED];
+	  denied++;
+	}
+      else if (m->action == SFW_ACTION_PERMIT)
+	{
+	  if (!m->session && m->is_local_src)
+	    permitted++;
+	}
+      else if ((m->action == SFW_ACTION_PERMIT_STATEFUL ||
+		m->action == SFW_ACTION_PERMIT_STATEFUL_NAT) &&
+	       !m->session && m->is_local_src)
+	{
+	  clib_bihash_kv_48_8_t gk = { 0 }, gr = { 0 };
+	  sfw_key6_t *gkey = (sfw_key6_t *) &gk.key;
+	  ip6_address_copy (&gkey->src, &ip0->dst_address);
+	  ip6_address_copy (&gkey->dst, &ip0->src_address);
+	  gkey->src_port = m->dst_port;
+	  gkey->dst_port = m->src_port;
+	  gkey->protocol = m->protocol;
+	  if (clib_bihash_search_48_8 (&sm->session_hash, &gk, &gr) == 0)
+	    {
+	      hits++;
+	      continue;
+	    }
+
+	  sfw_session_t *s = sfw_session_create (sm, thread_index, now);
+	  if (PREDICT_TRUE (s != 0))
+	    {
+	      s->is_ip6 = 1;
+	      s->nat_type = SFW_NAT_NONE;
+	      s->has_nat_key = 1;
+	      ip6_address_copy (&s->k6.src, &ip0->dst_address);
+	      ip6_address_copy (&s->k6.dst, &ip0->src_address);
+	      s->k6.src_port = m->dst_port;
+	      s->k6.dst_port = m->src_port;
+	      s->k6.protocol = m->protocol;
+
+	      u64 enc = sfw_session_encode (
+		thread_index, s - sm->sessions[thread_index]);
+
+	      clib_bihash_kv_48_8_t kv1, kv2;
+	      clib_memset (&kv1, 0, sizeof (kv1));
+	      clib_memcpy_fast (&kv1.key, &s->k6, sizeof (sfw_key6_t));
+	      kv1.value = enc;
+
+	      clib_memset (&kv2, 0, sizeof (kv2));
+	      sfw_key6_t *dk = (sfw_key6_t *) &kv2.key;
+	      ip6_address_copy (&dk->src, &ip0->src_address);
+	      ip6_address_copy (&dk->dst, &ip0->dst_address);
+	      dk->src_port = m->src_port;
+	      dk->dst_port = m->dst_port;
+	      dk->protocol = m->protocol;
+	      kv2.value = enc;
+
+	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
+		{
+		  created++;
+		  local_originated++;
+		}
+	    }
+	}
+
+      if (is_trace && (bufs[i]->flags & VLIB_BUFFER_IS_TRACED))
+	{
+	  sfw_trace_t *t = vlib_add_trace (vm, node, bufs[i], sizeof (*t));
+	  t->sw_if_index = vnet_buffer (bufs[i])->sw_if_index[VLIB_TX];
+	  t->next_index = nexts[i];
+	  t->action = m->action;
+	  t->session_found = (m->session != 0);
+	  t->protocol = m->protocol;
+	  t->nat_applied = 0;
+	}
+    }
+
+  vlib_buffer_enqueue_to_next (vm, node, from, nexts, n_vectors);
+  sfw_expire_inline (sm, thread_index, now);
+
+  vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_PROCESSED,
+			       n_vectors);
+  vlib_node_increment_counter (vm, node->node_index,
+			       SFW_ERROR_SESSIONS_CREATED, created);
+  vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_SESSION_HITS,
+			       hits);
+  vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_DENIED,
+			       denied);
+  vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_PERMITTED,
+			       permitted);
+  vlib_node_increment_counter (vm, node->node_index,
+			       SFW_ERROR_LOCAL_ORIGINATED, local_originated);
+  return n_vectors;
+}
+
+VLIB_NODE_FN (sfw_ip6_output_node)
+(vlib_main_t *vm, vlib_node_runtime_t *node, vlib_frame_t *frame)
+{
+  if (PREDICT_FALSE (node->flags & VLIB_NODE_FLAG_TRACE))
+    return sfw_ip6_output_inline (vm, node, frame, 1);
+  else
+    return sfw_ip6_output_inline (vm, node, frame, 0);
+}
+
 /* --- Node registrations --- */
 
 #ifndef CLIB_MARCH_VARIANT
@@ -1136,6 +1760,32 @@ VLIB_REGISTER_NODE (sfw_ip4_node) = {
 
 VLIB_REGISTER_NODE (sfw_ip6_node) = {
   .name = "sfw-ip6",
+  .vector_size = sizeof (u32),
+  .format_trace = format_sfw_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = ARRAY_LEN (sfw_error_strings),
+  .error_strings = sfw_error_strings,
+  .n_next_nodes = SFW_N_NEXT,
+  .next_nodes = {
+    [SFW_NEXT_DROP] = "error-drop",
+  },
+};
+
+VLIB_REGISTER_NODE (sfw_ip4_output_node) = {
+  .name = "sfw-ip4-out",
+  .vector_size = sizeof (u32),
+  .format_trace = format_sfw_trace,
+  .type = VLIB_NODE_TYPE_INTERNAL,
+  .n_errors = ARRAY_LEN (sfw_error_strings),
+  .error_strings = sfw_error_strings,
+  .n_next_nodes = SFW_N_NEXT,
+  .next_nodes = {
+    [SFW_NEXT_DROP] = "error-drop",
+  },
+};
+
+VLIB_REGISTER_NODE (sfw_ip6_output_node) = {
+  .name = "sfw-ip6-out",
   .vector_size = sizeof (u32),
   .format_trace = format_sfw_trace,
   .type = VLIB_NODE_TYPE_INTERNAL,

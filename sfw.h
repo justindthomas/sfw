@@ -404,6 +404,8 @@ sfw_expire_inline (sfw_main_t *sm, u32 thread_index, f64 now)
 
 extern vlib_node_registration_t sfw_ip4_node;
 extern vlib_node_registration_t sfw_ip6_node;
+extern vlib_node_registration_t sfw_ip4_output_node;
+extern vlib_node_registration_t sfw_ip6_output_node;
 
 void sfw_feature_init (sfw_main_t *sm);
 

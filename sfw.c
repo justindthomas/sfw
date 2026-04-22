@@ -71,6 +71,12 @@ sfw_enable_disable_interface (sfw_main_t *sm, u32 sw_if_index,
 			       enable_disable, 0, 0);
   vnet_feature_enable_disable ("ip6-unicast", "sfw-ip6", sw_if_index,
 			       enable_disable, 0, 0);
+  /* Output arcs catch VPP self-generated and VCL-app traffic so
+   * (local, *) zone-pair policies can gate them. */
+  vnet_feature_enable_disable ("ip4-output", "sfw-ip4-out", sw_if_index,
+			       enable_disable, 0, 0);
+  vnet_feature_enable_disable ("ip6-output", "sfw-ip6-out", sw_if_index,
+			       enable_disable, 0, 0);
 
   sm->if_config[sw_if_index].feature_on = enable_disable ? 1 : 0;
   return 0;
@@ -1259,6 +1265,21 @@ VNET_FEATURE_INIT (sfw_ip6, static) = {
   .runs_after = VNET_FEATURES ("acl-plugin-in-ip6-fa",
 			       "ip6-sv-reassembly-feature"),
   .runs_before = VNET_FEATURES ("ip6-lookup"),
+};
+
+/* Output arcs: catch VPP self-generated and VCL-originated traffic that
+ * never traversed the input arc.  Run late so all post-lookup features
+ * (e.g., classifier, policer) have already executed. */
+VNET_FEATURE_INIT (sfw_ip4_out, static) = {
+  .arc_name = "ip4-output",
+  .node_name = "sfw-ip4-out",
+  .runs_before = VNET_FEATURES ("interface-output"),
+};
+
+VNET_FEATURE_INIT (sfw_ip6_out, static) = {
+  .arc_name = "ip6-output",
+  .node_name = "sfw-ip6-out",
+  .runs_before = VNET_FEATURES ("interface-output"),
 };
 
 /* --- Plugin registration --- */
