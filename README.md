@@ -34,16 +34,20 @@ sfw policy inbound default-action deny
 
 ### Feature Arc Position
 
-SFW runs as a single node per address family on the unicast feature arcs,
-before ip4-lookup / ip6-lookup:
+SFW runs on both the input (unicast) and output arcs for each address
+family:
 
 ```
 ip4-unicast: ... → acl-plugin → ip4-sv-reassembly → sfw-ip4 → ip4-lookup
+ip4-output:  ip4-rewrite → ... → sfw-ip4-out → interface-output
 ip6-unicast: ... → acl-plugin → ip6-sv-reassembly → sfw-ip6 → ip6-lookup
+ip6-output:  ip6-rewrite → ... → sfw-ip6-out → interface-output
 ```
 
-There is no post-lookup node. NAT translation happens in the same pre-lookup
-node as firewall evaluation. This avoids the worker handoff problem entirely.
+NAT translation happens in the pre-lookup node — same position as firewall
+evaluation — which avoids the worker handoff problem entirely. The
+output-arc nodes exist to catch locally-originated traffic that never
+transits the input arc (see *Locally-Originated Traffic* below).
 
 ### Session Table
 
@@ -276,6 +280,51 @@ never blocked by zone-pair policies. IPv4 broadcast (`255.255.255.255`),
 multicast (`224.0.0.0/4`), and unspecified source (`0.0.0.0`) are similarly
 bypassed.
 
+### Locally-Originated Traffic
+
+**Problem**: Packets VPP itself generates — ICMP echo replies, TCP RSTs
+to unknown flows, DHCP-client, IKEv2, BFD, IPFIX export, `vppctl ping`,
+and any VCL-based app (including vcl-rs BGP daemons) — do not traverse
+the `ip4-unicast` / `ip6-unicast` input feature arcs. Without a matching
+session, the peer's reply hits the inbound deny policy and gets dropped.
+
+**Solution**: Twin nodes `sfw-ip4-out` / `sfw-ip6-out` run on the
+`ip4-output` / `ip6-output` feature arcs. They:
+
+1. Look up the session hash — forwarded traffic (input → lookup →
+   rewrite → output) matches an existing session here and passes
+   through without creating a duplicate.
+2. On a miss, do a FIB lookup on the packet's **source** address. If
+   it resolves to `DPO_RECEIVE` the packet is locally-originated;
+   otherwise the packet is just transiting and we let it pass.
+3. For locally-originated packets, synthesize `src_zone = SFW_ZONE_LOCAL`
+   and take `dst_zone` from the TX interface's zone assignment. The
+   (local, dst_zone) zone-pair policy decides permit/deny and whether
+   to create a session.
+4. When a session is created here, the `kv1`/`kv2` hash entries use
+   the same layout as the input arc, so return traffic finds the
+   session via the existing input-side lookup logic without any
+   special handling.
+
+Output-arc features are enabled on the same interfaces as the input-arc
+feature (driven by zone assignment), so no additional configuration is
+required. Policies for locally-originated traffic are written against
+the built-in `local` zone:
+
+```
+sfw policy egress-local from-zone local to-zone external
+sfw policy egress-local default-action permit-stateful
+```
+
+Host-stack daemons that talk to VPP via a tap interface (FRR, BIRD,
+etc.) **do** traverse the input arc on the tap RX and are handled by
+the existing input-side logic — the output-arc hook is strictly for
+traffic VPP's own data plane generates.
+
+Buffer access on the output arc requires skipping `ip.save_rewrite_length`
+bytes because `ip4-rewrite` has already prepended the L2 rewrite to
+`current_data` before the output feature arc runs.
+
 ### IPv6 permit-stateful-nat
 
 IPv6 policies can use the `permit-stateful-nat` action (inherited from a
@@ -290,7 +339,7 @@ IPv4 and IPv6 on the same zone pair.
 |------|---------|
 | `sfw.h` | All data structures: session keys, sessions, rules, policies, zones, plugin main |
 | `sfw.c` | Plugin init, CLI commands (zone, policy, nat pool/static, show/clear), feature arc registration |
-| `sfw_node.c` | Packet processing: sfw-ip4 and sfw-ip6 graph nodes (two-pass design) |
+| `sfw_node.c` | Packet processing: sfw-ip4 / sfw-ip6 input nodes and sfw-ip4-out / sfw-ip6-out output nodes (two-pass design) |
 | `sfw_rules.c` | Rule matching: first-match evaluation with prefix/port/protocol/ICMP filtering |
 | `sfw_session.c` | Session lifecycle: create, remove (with dual hash cleanup), format for display |
 | `sfw_nat.c` | NAT pool management (deterministic and dynamic modes), static 1:1 / DNAT mappings, per-thread port bitmaps, address/port translation, incremental checksum updates |
