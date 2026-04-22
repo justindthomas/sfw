@@ -241,27 +241,92 @@ format_sfw_session (u8 *s, va_list *args)
 /* --- Periodic session expiry process ---
  *
  * sfw_expire_inline is called per-frame from each worker's sfw_ip4/ip6
- * nodes. If a worker stops seeing sfw-covered packets (e.g. multi-queue
- * NIC steers broadcast/ARP/NDP to one queue and the RSS-hashed IP flows
- * that created sessions on that worker go silent), nothing drives the
- * expiry walk — sessions with expired TTLs sit in the pool indefinitely.
+ * nodes and walks the LRU from tail until it hits a non-expired
+ * session. That is fast and correct for same-thread flows — every
+ * packet match on the owner thread calls sfw_lru_touch, which moves
+ * the session to LRU head, so LRU-tail is truly the oldest.
  *
- * This process node runs on the main thread, wakes every
- * SFW_EXPIRE_INTERVAL seconds, takes the worker barrier, and sweeps
- * every per-worker pool. With the barrier held no worker is running
- * sfw packet paths, so reusing sfw_expire_inline on each thread_index
- * is safe: we're the only writer of sessions[ti] / lru_tail[ti] /
- * pending_free[ti] for the duration.
+ * It is *wrong* for cross-thread refresh: when a reverse-direction
+ * packet hashes to a different worker, sfw_node.c bumps
+ * session->expires but cannot call sfw_lru_touch (the LRU is
+ * per-thread and touching another thread's LRU isn't safe). The
+ * session stays at its old LRU position with a fresh expires, and
+ * the owner's per-frame LRU walk breaks on it — stranding every
+ * genuinely-expired session behind it. Observed on Mellanox AF_XDP
+ * where reverse-path RSS routinely lands return traffic on a
+ * different worker than the session's owner.
  *
- * SFW_EXPIRE_INTERVAL is deliberately coarse (several seconds) — the
- * per-frame expiry path still runs under traffic and does the heavy
- * lifting. This is a backstop for the idle-worker case, not the hot
- * path. Barrier hold time is O(expired sessions across all workers),
- * which for a home router is microseconds; upping the interval keeps
- * it that way.
+ * The backstop: wake every SFW_EXPIRE_INTERVAL seconds on the main
+ * thread, take the worker barrier, and scan each per-worker pool in
+ * full (pool_foreach, not LRU-follow) so cross-thread-refreshed
+ * sessions that eventually expire don't strand everything behind
+ * them. The per-frame LRU walk remains the hot-path optimization;
+ * this is the correctness backstop.
+ *
+ * Barrier hold time is O(sessions across all workers). Home-router
+ * volumes (hundreds of sessions) are microseconds; larger deployments
+ * can raise SFW_EXPIRE_INTERVAL to amortize.
  */
 
 #define SFW_EXPIRE_INTERVAL 5.0
+
+/* Full-pool expiry sweep for one thread's session pool. Same two-phase
+ * defer pattern as sfw_expire_inline so it interleaves cleanly with the
+ * per-frame path: phase 1 pool_put's whatever was queued last cycle,
+ * phase 2 unhashes every session whose expires is in the past and
+ * queues it for next cycle. Must run under the worker barrier.
+ */
+static void
+sfw_expire_full_sweep (sfw_main_t *sm, u32 thread_index, f64 now)
+{
+  /* Phase 1: drain previous cycle's pending_free. Either this sweep
+   * or the per-frame path could have populated it — both share the
+   * same vector. */
+  u32 *pf = sm->pending_free[thread_index];
+  for (u32 j = 0; j < vec_len (pf); j++)
+    pool_put_index (sm->sessions[thread_index], pf[j]);
+  vec_reset_length (pf);
+
+  /* Phase 1a: honour a pending `clear sfw session` request. Mirrors
+   * the inline path; owner-thread-only writers to these per-thread
+   * structures are still the only writers here because the barrier
+   * is held. */
+  if (PREDICT_FALSE (sm->clear_requested[thread_index]))
+    {
+      sm->clear_requested[thread_index] = 0;
+      sfw_session_t *s;
+      u32 *indices = 0;
+      pool_foreach (s, sm->sessions[thread_index])
+	{
+	  vec_add1 (indices, s - sm->sessions[thread_index]);
+	}
+      for (u32 j = 0; j < vec_len (indices); j++)
+	{
+	  s = pool_elt_at_index (sm->sessions[thread_index], indices[j]);
+	  sfw_session_unhash (sm, s);
+	  sfw_lru_remove (sm, s);
+	  pool_put (sm->sessions[thread_index], s);
+	}
+      vec_free (indices);
+      sm->pending_free[thread_index] = pf;
+      return;
+    }
+
+  /* Phase 2: walk the pool, not the LRU. Catch every expired session
+   * regardless of LRU position. */
+  sfw_session_t *s;
+  pool_foreach (s, sm->sessions[thread_index])
+    {
+      if (s->expires < now)
+	{
+	  u32 si = s - sm->sessions[thread_index];
+	  sfw_session_unhash (sm, s);
+	  sfw_lru_remove (sm, s);
+	  vec_add1 (pf, si);
+	}
+    }
+  sm->pending_free[thread_index] = pf;
+}
 
 static uword
 sfw_expire_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
@@ -289,7 +354,7 @@ sfw_expire_process (vlib_main_t *vm, vlib_node_runtime_t *rt,
        * giving slots [0 .. nworkers] (main + each worker). Iterate all
        * slots so we cover workers whose packet path has gone idle. */
       for (u32 ti = 0; ti < n_slots; ti++)
-	sfw_expire_inline (sm, ti, now);
+	sfw_expire_full_sweep (sm, ti, now);
       vlib_worker_thread_barrier_release (vm);
     }
   return 0;
