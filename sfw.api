@@ -129,6 +129,25 @@ autoreply define sfw_nat64_pool_add_del
   vl_api_prefix_t nat64_prefix;    /* IPv6 */
 };
 
+/** Enable or disable RFC 8781 PREF64 Router Advertisement option.
+ *
+ * On is_add=true: RAs sent on sw_if_index will carry a PREF64 option
+ * pointing at nat64_prefix with lifetime_sec. nat64_prefix must match
+ * an existing NAT64 pool (otherwise the router would advertise a
+ * prefix it doesn't actually translate). lifetime_sec == 0 selects a
+ * sane default (1800s, clamped to the RFC 8781 maximum of 65528s).
+ *
+ * On is_add=false only sw_if_index is consulted. */
+autoreply define sfw_pref64_advertise_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_prefix_t nat64_prefix;
+  u16 lifetime_sec;
+};
+
 /** Create or delete a static (DNAT) mapping.
  *
  * protocol = 0 means 1:1 IP-level mapping (no port translation);

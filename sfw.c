@@ -1130,6 +1130,113 @@ VLIB_CLI_COMMAND (sfw_show_nat64_command, static) = {
   .function = sfw_show_nat64_command_fn,
 };
 
+/* --- CLI: sfw pref64 (RFC 8781 RA option) ---
+ *
+ *   sfw pref64 advertise <interface> prefix <v6-prefix>/<len> [lifetime <s>]
+ *   sfw pref64 disable   <interface>
+ *   show sfw pref64
+ *
+ * The prefix must match an existing NAT64 pool — we refuse to
+ * advertise a prefix we don't actually translate. */
+
+static clib_error_t *
+sfw_pref64_command_fn (vlib_main_t *vm, unformat_input_t *input,
+		       vlib_cli_command_t *cmd)
+{
+  sfw_main_t *sm = &sfw_main;
+  vnet_main_t *vnm = sm->vnet_main;
+  u32 sw_if_index = ~0;
+  int is_add = 1;
+  ip6_address_t prefix;
+  u32 prefix_len = 0;
+  u32 lifetime = 0;
+
+  clib_memset (&prefix, 0, sizeof (prefix));
+
+  if (unformat (input, "advertise"))
+    is_add = 1;
+  else if (unformat (input, "disable"))
+    is_add = 0;
+  else
+    return clib_error_return (0, "expected 'advertise' or 'disable'");
+
+  if (!unformat (input, "%U", unformat_vnet_sw_interface, vnm, &sw_if_index))
+    return clib_error_return (0, "expected <interface>");
+
+  if (is_add)
+    {
+      if (!unformat (input, "prefix %U/%u", unformat_ip6_address, &prefix,
+		     &prefix_len))
+	return clib_error_return (0, "expected 'prefix <v6-prefix>/<len>'");
+
+      (void) unformat (input, "lifetime %u", &lifetime);
+
+      if (sfw_pref64_enable (sm, sw_if_index, &prefix, (u8) prefix_len,
+			     (u16) lifetime) != 0)
+	return clib_error_return (
+	  0, "no matching NAT64 pool with prefix %U/%u; add one first with "
+	     "'sfw nat64 pool add ... prefix %U/%u'",
+	  format_ip6_address, &prefix, prefix_len, format_ip6_address,
+	  &prefix, prefix_len);
+      vlib_cli_output (vm, "PREF64 advertising %U/%u on %U",
+		       format_ip6_address, &prefix, prefix_len,
+		       format_vnet_sw_if_index_name, vnm, sw_if_index);
+    }
+  else
+    {
+      sfw_pref64_disable (sm, sw_if_index);
+      vlib_cli_output (vm, "PREF64 disabled on %U",
+		       format_vnet_sw_if_index_name, vnm, sw_if_index);
+    }
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sfw_pref64_command, static) = {
+  .path = "sfw pref64",
+  .short_help = "sfw pref64 advertise <intf> prefix <v6-prefix>/<len> "
+		"[lifetime <s>] | sfw pref64 disable <intf>",
+  .function = sfw_pref64_command_fn,
+};
+
+static clib_error_t *
+sfw_show_pref64_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			    vlib_cli_command_t *cmd)
+{
+  sfw_main_t *sm = &sfw_main;
+  vnet_main_t *vnm = sm->vnet_main;
+  u32 n = 0;
+
+  for (u32 i = 0; i < vec_len (sm->if_config); i++)
+    {
+      sfw_if_config_t *ic = &sm->if_config[i];
+      if (!ic->pref64_advertise)
+	continue;
+      n++;
+      /* Decode cached option bytes for display. */
+      u16 combined = ((u16) ic->pref64_option_bytes[2] << 8) |
+		     ic->pref64_option_bytes[3];
+      u32 lifetime_sec = ((u32) (combined >> 3)) * 8;
+      u8 plc = combined & 0x7;
+      static const u8 plc_to_len[] = { 96, 64, 56, 48, 40, 32, 0, 0 };
+      u8 len = plc_to_len[plc];
+      ip6_address_t prefix;
+      clib_memset (&prefix, 0, sizeof (prefix));
+      clib_memcpy_fast (prefix.as_u8, &ic->pref64_option_bytes[4], 12);
+      vlib_cli_output (vm, "  %U: %U/%u lifetime %us",
+		       format_vnet_sw_if_index_name, vnm, i,
+		       format_ip6_address, &prefix, len, lifetime_sec);
+    }
+  if (n == 0)
+    vlib_cli_output (vm, "no interfaces advertising PREF64");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sfw_show_pref64_command, static) = {
+  .path = "show sfw pref64",
+  .short_help = "show sfw pref64",
+  .function = sfw_show_pref64_command_fn,
+};
+
 /* --- CLI: sfw nat static --- */
 
 static clib_error_t *
@@ -1402,6 +1509,13 @@ sfw_init (vlib_main_t *vm)
   clib_error_t *err = sfw_plugin_api_hookup (vm);
   if (err)
     return err;
+
+  /* Register the PREF64 RA option callback with VPP's ip6_ra. The
+   * callback is a no-op on interfaces that haven't opted in via
+   * 'sfw pref64 advertise', so this is safe to install unconditionally
+   * even when NAT64 is unused. Relies on the core-side extra-option
+   * hook shipped in vpp-patches/. */
+  sfw_pref64_init ();
 
   return 0;
 }

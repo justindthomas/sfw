@@ -523,6 +523,44 @@ done:
   REPLY_MACRO (VL_API_SFW_NAT64_POOL_ADD_DEL_REPLY);
 }
 
+/* --- sfw_pref64_advertise_add_del --- */
+
+static void
+vl_api_sfw_pref64_advertise_add_del_t_handler (
+  vl_api_sfw_pref64_advertise_add_del_t *mp)
+{
+  sfw_main_t *sm = &sfw_main;
+  vl_api_sfw_pref64_advertise_add_del_reply_t *rmp;
+  int rv = 0;
+  u32 sw_if_index = ntohl (mp->sw_if_index);
+
+  if (mp->is_add)
+    {
+      fib_prefix_t v6_fp;
+      ip_prefix_decode (&mp->nat64_prefix, &v6_fp);
+      if (v6_fp.fp_proto != FIB_PROTOCOL_IP6)
+	{
+	  rv = VNET_API_ERROR_INVALID_ADDRESS_FAMILY;
+	  goto done;
+	}
+      if (sfw_pref64_enable (sm, sw_if_index, &v6_fp.fp_addr.ip6,
+			     (u8) v6_fp.fp_len, ntohs (mp->lifetime_sec)) !=
+	  0)
+	{
+	  rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+	  goto done;
+	}
+    }
+  else
+    {
+      if (sfw_pref64_disable (sm, sw_if_index) != 0)
+	rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+done:
+  REPLY_MACRO (VL_API_SFW_PREF64_ADVERTISE_ADD_DEL_REPLY);
+}
+
 /* --- sfw_nat_static_add_del --- */
 
 static void

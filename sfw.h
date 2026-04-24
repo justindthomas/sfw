@@ -254,6 +254,14 @@ typedef struct
 {
   u32 zone_id;	  /* which zone this interface belongs to (0 = none) */
   u8 feature_on; /* 1 if sfw feature arcs are enabled on this interface */
+
+  /* RFC 8781 PREF64 option advertisement. When pref64_advertise is
+   * set, sfw's callback appends a 16-byte PREF64 option to every RA
+   * emitted on this interface. pref64_option_bytes is the exact wire
+   * format, precomputed from the pool prefix and lifetime at config
+   * time so the hot path is a straight 16-byte buffer append. */
+  u8 pref64_advertise;
+  u8 pref64_option_bytes[16];
 } sfw_if_config_t;
 
 /* --- Plugin main --- */
@@ -545,6 +553,27 @@ int sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
  * ports. Grows the buffer by 20 bytes (requires buffer headroom). */
 int sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
 				  sfw_session_t *session);
+
+/* --- PREF64 Router Advertisement option (RFC 8781) ---
+ *
+ * Registered at plugin init via VPP's ip6_ra_extra_option_register (a
+ * small core-side hook shipped alongside sfw in vpp-patches/). Emits
+ * the 16-byte PREF64 option on every RA sent on interfaces where
+ * sfw_pref64_enable has been called. */
+
+/* Plugin-init registration; called once from sfw_feature_init. */
+void sfw_pref64_init (void);
+
+/* Enable / disable PREF64 advertisement on an interface. prefix and
+ * prefix_len must match an existing SFW_POOL_KIND_NAT64 pool (so the
+ * advertised prefix is one the router actually translates). lifetime_sec
+ * == 0 means "auto" (derive from RA default lifetime, clamped to
+ * RFC 8781 max 65528s). Returns 0 on success, -1 if pool not found or
+ * prefix length not one of {32,40,48,56,64,96}. */
+int sfw_pref64_enable (sfw_main_t *sm, u32 sw_if_index,
+		       const ip6_address_t *prefix, u8 prefix_len,
+		       u16 lifetime_sec);
+int sfw_pref64_disable (sfw_main_t *sm, u32 sw_if_index);
 
 format_function_t format_sfw_session;
 

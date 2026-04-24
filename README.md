@@ -436,6 +436,65 @@ xlate.n64.v4_server`). Error counters cover successful translations
   `sfw-ip4-out` if enabled, so per-interface egress filtering works,
   but the v4 zone-pair policy is not re-evaluated.
 
+### PREF64 Router Advertisements (RFC 8781)
+
+Once a NAT64 prefix is configured, IPv6 hosts on directly-attached
+segments need to discover it. The cleanest client-side mechanism is
+the **PREF64 RA option** (RFC 8781): a small option the router
+embeds in every Router Advertisement that tells hosts "packets
+destined to this /96 (or /64, /56, /48, /40, /32) will be NAT64'd
+to IPv4 by me." Recent Linux (5.3+), iOS, macOS, and Android pick
+this up automatically, enabling 464XLAT / CLAT without requiring
+DNS64 on every client.
+
+VPP's stock `ip6-nd` has no PREF64 support. sfw adds it by way of a
+small core-side hook to `src/vnet/ip6-nd/ip6_ra.c` that lets
+plugins register additional RA-option callbacks. The hook lives in
+`vpp-patches/0001-ip6-ra-extra-option-hook.patch`, applied by
+`build.sh` inside the build container before the VPP tree is
+compiled. It is scheduled for upstream submission; once merged, the
+patch file can be dropped.
+
+**Why augment VPP's RAs instead of emitting our own** — VPP's
+existing RA builder handles prefix-info, MTU, source-link-layer
+address, timers, rate-limiting, and the Router Solicitation reply
+path. Running a parallel sfw-side RA engine would duplicate all of
+that and drift as VPP evolves. The hook approach adds ~15 lines to
+VPP and lets hosts see one coherent RA with our PREF64 option
+alongside everything VPP already puts in.
+
+**Configuration**
+
+```
+sfw nat64 pool add 203.0.113.0/29 prefix 64:ff9b::/96
+sfw pref64 advertise GigabitEthernet0/0/0 prefix 64:ff9b::/96 lifetime 1800
+show sfw pref64
+```
+
+The `prefix` argument must match an existing NAT64 pool — the CLI
+refuses to advertise a prefix sfw doesn't actually translate, which
+would black-hole client traffic. `lifetime` is in seconds; omitting
+it selects a sane default (1800s). Per RFC 8781 the lifetime is
+encoded in 8-second units with 13 bits of precision, capped at
+65528s.
+
+**Verification**
+
+On the client segment: `tcpdump -vv -n 'icmp6 and ip6[40]=134' -i
+<iface>` — each RA (periodic or solicited) should include option
+type 38 with length 2, the correct scaled lifetime and PLC, and the
+prefix bytes matching the configured NAT64 prefix. `rdisc6 <iface>`
+from a Linux host triggers a solicited RA so you don't have to wait
+for the periodic tick.
+
+**Callback flow** — at sfw plugin init, `sfw_pref64_init()` calls
+`ip6_ra_extra_option_register(sfw_pref64_ra_option_cb)`. Every time
+VPP's RA builder reaches the "add additional options" point it
+invokes all registered callbacks. The sfw callback checks
+`sfw_if_config_t.pref64_advertise` for the TX interface; if set, it
+appends the 16-byte precomputed option via `vlib_buffer_add_data`
+and bumps the RA's payload length. Zero allocation on the hot path.
+
 ## File Structure
 
 | File | Purpose |
@@ -447,5 +506,7 @@ xlate.n64.v4_server`). Error counters cover successful translations
 | `sfw_session.c` | Session lifecycle: create, remove (with dual hash cleanup), format for display |
 | `sfw_nat.c` | NAT44 pool management (deterministic and dynamic modes), static 1:1 / DNAT mappings, per-thread port bitmaps, address/port translation, incremental checksum updates |
 | `sfw_nat64.c` | NAT64 (RFC 6146): RFC 6052 prefix embed/extract, v6↔v4 packet translation (TCP/UDP inline, ICMP via core VPP `ip6_to_ip4.h` / `ip4_to_ip6.h` helpers), pool matching |
-| `sfw.api` | Binary API definitions (policy/rule, NAT pool, NAT static, NAT64 pool, zone and interface ops) |
+| `sfw_pref64.c` | RFC 8781 PREF64 RA option: per-interface config, precomputed option bytes, callback registered via VPP's `ip6_ra_extra_option_register` (see `vpp-patches/`) |
+| `vpp-patches/` | Small patches against core VPP required by sfw, applied at container-build time. Currently: `0001-ip6-ra-extra-option-hook.patch` — adds the RA extra-option callback API. Upstream-bound |
+| `sfw.api` | Binary API definitions (policy/rule, NAT pool, NAT static, NAT64 pool, PREF64 advertise, zone and interface ops) |
 | `sfw_test.c` | VAT test client for the binary API |

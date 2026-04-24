@@ -1,0 +1,106 @@
+From: sfw-plugin <noreply@anthropic.com>
+Subject: [PATCH] ip6-ra: add extra-option callback hook for third-party plugins
+
+Adds ip6_ra_extra_option_register() / _unregister() so plugins can
+inject additional RA options (e.g. the PREF64 option from RFC 8781)
+into both solicited and periodic Router Advertisements, which share
+the same builder in icmp6_router_solicitation.
+
+Used by the sfw plugin to advertise NAT64 prefixes alongside VPP's
+existing prefix-info, MTU, and source-link-layer-address options, so
+clients see a single augmented RA rather than two competing RAs.
+---
+--- a/src/vnet/ip6-nd/ip6_ra.c	2026-04-23 19:41:43
++++ b/src/vnet/ip6-nd/ip6_ra.c	2026-04-23 19:42:37
+@@ -59,6 +59,12 @@
+ /* vector of registered RA report listeners */
+ static ip6_ra_report_notify_t *ip6_ra_listeners;
+ 
++/* Vector of extra-option callbacks registered by third-party plugins.
++ * Invoked inside the shared RA builder so both solicited and periodic
++ * RAs automatically include their options. See ip6_ra_extra_option_fn_t
++ * in ip6_ra.h. */
++static ip6_ra_extra_option_fn_t *ip6_ra_extra_option_cbs;
++
+ static int ip6_ra_publish (ip6_ra_report_t * r);
+ 
+ void
+@@ -84,6 +90,34 @@
+     if (ip6_ra_listeners[ii] == fn)
+       {
+ 	vec_del1 (ip6_ra_listeners, ii);
++	break;
++      }
++  }
++}
++
++void
++ip6_ra_extra_option_register (ip6_ra_extra_option_fn_t fn)
++{
++  ip6_ra_extra_option_fn_t *cb;
++  vec_foreach (cb, ip6_ra_extra_option_cbs)
++  {
++    if (*cb == fn)
++      return;
++  }
++
++  vec_add1 (ip6_ra_extra_option_cbs, fn);
++}
++
++void
++ip6_ra_extra_option_unregister (ip6_ra_extra_option_fn_t fn)
++{
++  u32 ii;
++
++  vec_foreach_index (ii, ip6_ra_extra_option_cbs)
++  {
++    if (ip6_ra_extra_option_cbs[ii] == fn)
++      {
++	vec_del1 (ip6_ra_extra_option_cbs, ii);
+ 	break;
+       }
+   }
+@@ -512,7 +546,17 @@
+                           }
+                       }
+ 
+-		      /* add additional options before here */
++		      /* Third-party plugins (e.g. sfw's PREF64 RA option,
++		       * RFC 8781) append additional options here via
++		       * ip6_ra_extra_option_register(). Each callback uses
++		       * vlib_buffer_add_data() against &bi0 and bumps
++		       * payload_length by the number of bytes it added. */
++		      {
++			ip6_ra_extra_option_fn_t *cb;
++			vec_foreach (cb, ip6_ra_extra_option_cbs)
++			  (*cb) (vm, &bi0, radv_info->sw_if_index,
++				 &payload_length);
++		      }
+ 
+ 		      /* finish building the router advertisement... */
+ 		      if (!is_unspecified && radv_info->send_unicast)
+--- a/src/vnet/ip6-nd/ip6_ra.h	2026-04-23 19:41:43
++++ b/src/vnet/ip6-nd/ip6_ra.h	2026-04-23 19:42:42
+@@ -166,4 +166,22 @@
+ 					       u32 valid_time,
+ 					       u32 preferred_time);
+ extern u8 ip6_ra_adv_enabled (u32 sw_if_index);
++
++/**
++ * Callback invoked while building each router advertisement, giving
++ * third-party plugins (e.g. sfw's NAT64 PREF64 option, RFC 8781) a
++ * chance to append additional RA options. Called once per outgoing RA
++ * for both solicited and periodic paths (they share the builder).
++ *
++ * Callbacks MUST use vlib_buffer_add_data() against *bi to append the
++ * raw option bytes and MUST bump *payload_length by the number of
++ * bytes appended. The caller folds the final payload_length into the
++ * IPv6 header and recomputes the ICMPv6 checksum after all callbacks
++ * have run.
++ */
++typedef void (*ip6_ra_extra_option_fn_t) (vlib_main_t *vm, u32 *bi,
++					  u32 sw_if_index, u16 *payload_length);
++extern void ip6_ra_extra_option_register (ip6_ra_extra_option_fn_t fn);
++extern void ip6_ra_extra_option_unregister (ip6_ra_extra_option_fn_t fn);
++
+ #endif /* included_ip6_neighbor_h */

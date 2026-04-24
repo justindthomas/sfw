@@ -10,6 +10,7 @@ add_vpp_plugin(sfw
   sfw_session.c
   sfw_nat.c
   sfw_nat64.c
+  sfw_pref64.c
   sfw.h
 
   MULTIARCH_SOURCES
