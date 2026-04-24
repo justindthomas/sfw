@@ -320,6 +320,31 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 
   if (mp->is_add)
     {
+      /* Idempotent add — same semantic as the CLI path. impd's
+       * boot-apply fires `sfw_nat_pool_add_del is_add=1` every
+       * start, so the handler must handle repeated identical
+       * requests without accumulating duplicates. */
+      u32 pi;
+      for (pi = 0; pi < vec_len (sm->nat_pools); pi++)
+	{
+	  sfw_nat_pool_t *p = &sm->nat_pools[pi];
+	  if (p->kind != SFW_POOL_KIND_NAT44)
+	    continue;
+	  if (p->external_addr.as_u32 == ext_addr.as_u32 &&
+	      p->external_plen == ext_plen &&
+	      p->internal_addr.as_u32 == int_addr.as_u32 &&
+	      p->internal_plen == int_plen)
+	    {
+	      if (p->mode != mp->mode)
+		{
+		  rv = VNET_API_ERROR_VALUE_EXIST;
+		  goto done;
+		}
+	      /* Identical pool already present — succeed. */
+	      goto done;
+	    }
+	}
+
       sfw_nat_pool_t pool;
       clib_memset (&pool, 0, sizeof (pool));
       pool.kind = SFW_POOL_KIND_NAT44;
@@ -425,6 +450,21 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
 
   if (mp->is_add)
     {
+      /* Idempotent add — see the NAT44 path. */
+      u32 pi;
+      for (pi = 0; pi < vec_len (sm->nat_pools); pi++)
+	{
+	  sfw_nat_pool_t *p = &sm->nat_pools[pi];
+	  if (p->kind != SFW_POOL_KIND_NAT64)
+	    continue;
+	  if (p->external_addr.as_u32 == ext_addr.as_u32 &&
+	      p->external_plen == ext_plen &&
+	      p->nat64_prefix_len == v6_plen &&
+	      clib_memcmp (&p->nat64_prefix, &v6_prefix,
+			   sizeof (ip6_address_t)) == 0)
+	    goto done; /* identical pool already present */
+	}
+
       sfw_nat_pool_t pool;
       clib_memset (&pool, 0, sizeof (pool));
       pool.kind = SFW_POOL_KIND_NAT64;

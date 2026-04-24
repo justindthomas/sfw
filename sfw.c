@@ -881,6 +881,33 @@ sfw_nat_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
     return clib_error_return (0, "internal prefix length %u > 32",
 			      internal_plen);
 
+  /* Idempotent add: if a NAT44 pool with matching ext+internal ranges
+   * already exists, treat this as a no-op success when mode matches,
+   * or fail loudly when it differs (operator should `sfw nat pool del`
+   * first to change mode). impd's boot-apply fires this same command
+   * on every start; without this guard it'd accumulate duplicates. */
+  for (u32 pi = 0; pi < vec_len (sm->nat_pools); pi++)
+    {
+      sfw_nat_pool_t *p = &sm->nat_pools[pi];
+      if (p->kind != SFW_POOL_KIND_NAT44)
+	continue;
+      if (p->external_addr.as_u32 == external_addr.as_u32 &&
+	  p->external_plen == external_plen &&
+	  p->internal_addr.as_u32 == internal_addr.as_u32 &&
+	  p->internal_plen == internal_plen)
+	{
+	  if (p->mode != mode)
+	    return clib_error_return (
+	      0, "pool exists with different mode (%s); delete first",
+	      p->mode == SFW_NAT_MODE_DETERMINISTIC ? "deterministic" :
+						       "dynamic");
+	  vlib_cli_output (vm, "NAT pool already present: %U/%u -> %U/%u",
+			   format_ip4_address, &external_addr, external_plen,
+			   format_ip4_address, &internal_addr, internal_plen);
+	  return 0;
+	}
+    }
+
   sfw_nat_pool_t pool;
   clib_memset (&pool, 0, sizeof (pool));
   pool.kind = SFW_POOL_KIND_NAT44;
@@ -977,6 +1004,26 @@ sfw_nat64_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   if (is_add)
     {
+      /* Idempotent add — see the NAT44 path for rationale. */
+      for (u32 pi = 0; pi < vec_len (sm->nat_pools); pi++)
+	{
+	  sfw_nat_pool_t *p = &sm->nat_pools[pi];
+	  if (p->kind != SFW_POOL_KIND_NAT64)
+	    continue;
+	  if (p->external_addr.as_u32 == external_addr.as_u32 &&
+	      p->external_plen == external_plen &&
+	      p->nat64_prefix_len == nat64_plen &&
+	      clib_memcmp (&p->nat64_prefix, &nat64_prefix,
+			   sizeof (ip6_address_t)) == 0)
+	    {
+	      vlib_cli_output (
+		vm, "NAT64 pool already present: %U/%u <- %U/%u",
+		format_ip4_address, &external_addr, external_plen,
+		format_ip6_address, &nat64_prefix, nat64_plen);
+	      return 0;
+	    }
+	}
+
       sfw_nat_pool_t pool;
       clib_memset (&pool, 0, sizeof (pool));
       pool.kind = SFW_POOL_KIND_NAT64;
