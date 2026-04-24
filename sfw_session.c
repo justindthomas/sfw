@@ -136,19 +136,30 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
     }
   else if (s->has_nat_key && s->nat_type == SFW_NAT_NAT64)
     {
-      /* v4 return key. Return direction: src = v4_server, dst = v4_pool,
-       * src_port = v4_dport (stored in k6.src_port after the ingress
-       * reversal), dst_port = allocated v4 pool port, protocol =
-       * translated from ICMPv6 to ICMP if applicable. */
+      /* v4 return key. Return direction: src = v4_server,
+       * dst = v4_pool. For TCP/UDP, src_port is the v4 dport
+       * (= k6.src_port after the ingress reversal) and dst_port
+       * is the allocated v4 pool port. For ICMP the on-wire id
+       * equals v4_pool_port in both directions (we rewrote it in
+       * the forward translation; remote echoes it back), so both
+       * key port fields are v4_pool_port to match sfw_extract_l4
+       * on return. */
       clib_memset (&kv, 0, sizeof (kv));
       sfw_key4_t *nk = (sfw_key4_t *) &kv.key;
       nk->src = s->xlate.n64.v4_server;
       nk->dst = s->xlate.n64.v4_pool;
-      nk->src_port = s->k6.src_port;
-      nk->dst_port = s->xlate.n64.v4_pool_port;
-      nk->protocol = (s->k6.protocol == IP_PROTOCOL_ICMP6) ?
-		       IP_PROTOCOL_ICMP :
-		       s->k6.protocol;
+      if (s->k6.protocol == IP_PROTOCOL_ICMP6)
+	{
+	  nk->src_port = s->xlate.n64.v4_pool_port;
+	  nk->dst_port = s->xlate.n64.v4_pool_port;
+	  nk->protocol = IP_PROTOCOL_ICMP;
+	}
+      else
+	{
+	  nk->src_port = s->k6.src_port;
+	  nk->dst_port = s->xlate.n64.v4_pool_port;
+	  nk->protocol = s->k6.protocol;
+	}
       rv = clib_bihash_add_del_48_8 (&sm->session_hash, &kv, 0 /* is_add */);
       if (PREDICT_FALSE (rv != 0))
 	clib_warning ("sfw: NAT64 v4-return hash delete failed (rv=%d)", rv);

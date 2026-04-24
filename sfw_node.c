@@ -1292,18 +1292,29 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      kv1.value = enc;
 
 	      /* kv2: v4 return key (zero-padded to 48). Return
-	       * direction: v4 server -> v4 pool, src_port = v4_dport
-	       * (= m->dst_port), dst_port = allocated v4 pool port,
-	       * protocol = translated (ICMPv6 -> ICMP). */
+	       * direction: v4 server -> v4 pool.
+	       *   TCP/UDP: src_port = v4_dport (= m->dst_port),
+	       *            dst_port = allocated v4 pool port.
+	       *   ICMP:    both ports carry the echo id, which we
+	       *            rewrote to v4_pool_port in the forward
+	       *            translation; remote echoes it back, so
+	       *            both port fields match v4_pool_port. */
 	      clib_memset (&kv2, 0, sizeof (kv2));
 	      sfw_key4_t *nk = (sfw_key4_t *) &kv2.key;
 	      nk->src = m->nat64_v4_server;
 	      nk->dst = m->nat64_v4_pool;
-	      nk->src_port = m->dst_port;
-	      nk->dst_port = m->nat64_v4_pool_port;
-	      nk->protocol = (m->protocol == IP_PROTOCOL_ICMP6) ?
-			       IP_PROTOCOL_ICMP :
-			       m->protocol;
+	      if (m->protocol == IP_PROTOCOL_ICMP6)
+		{
+		  nk->src_port = m->nat64_v4_pool_port;
+		  nk->dst_port = m->nat64_v4_pool_port;
+		  nk->protocol = IP_PROTOCOL_ICMP;
+		}
+	      else
+		{
+		  nk->src_port = m->dst_port;
+		  nk->dst_port = m->nat64_v4_pool_port;
+		  nk->protocol = m->protocol;
+		}
 	      kv2.value = enc;
 
 	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
