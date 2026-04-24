@@ -66,6 +66,43 @@ typedef enum
   SFW_POOL_KIND_NAT64 = 1,
 } sfw_pool_kind_t;
 
+/* Shared port allocator for a v4 external address range.
+ *
+ * Two pools that use overlapping v4 external ranges (e.g. a NAT44
+ * pool and a NAT64 pool both SNAT'ing through the same public /32)
+ * MUST share their port-allocation state: otherwise each pool's
+ * independent bitmap could hand out the same (v4_pool_addr, port)
+ * to different flows, producing identical v4 return 5-tuples that
+ * collide in the session hash. The second session silently
+ * overwrites the first in bihash, mistranslating replies.
+ *
+ * Allocators are reference-counted and keyed by
+ * (external_addr, external_plen). Pool add gets-or-creates the
+ * allocator; pool del decrements, and the last release frees the
+ * bitmaps. The allocation semantics (per-thread port slices,
+ * bitmaps indexed by external_idx) match the old per-pool design
+ * verbatim — this is a structural lift, not a behavior change. */
+typedef struct
+{
+  ip4_address_t external_addr; /* key + pool index base */
+  u8 external_plen;
+  u32 n_external_addrs;
+
+  u16 port_range_start; /* typically 1024 */
+  u16 port_range_end;   /* typically 65535 */
+
+  /* Per-thread port bitmaps. Each thread allocates from an
+   * exclusive slice so no locking is needed. port_bitmaps[thread]
+   * is a vec of n_external_addrs bitmaps (one per external address
+   * in the range). */
+  clib_bitmap_t ***port_bitmaps; /* vec[nworkers] of vec[n_ext_addrs] */
+  u32 **next_port;		  /* vec[nworkers] of vec[n_ext_addrs] */
+  u16 *thread_port_start;	  /* vec[nworkers] — first port for this thread */
+  u16 *thread_port_count;	  /* vec[nworkers] — number of ports for this thread */
+
+  u32 ref_count; /* freed when it reaches zero */
+} sfw_v4_port_alloc_t;
+
 /* NAT pool: maps internal prefix to external prefix.
  * For NAT44 (kind == NAT44) the internal_addr/plen describes the v4 source
  * range to translate and external_addr/plen the v4 pool to translate into.
@@ -73,10 +110,9 @@ typedef enum
  * but internal_addr/plen is unused; nat64_prefix / nat64_prefix_len
  * describe the RFC 6052 prefix used to embed the v4 destination in v6.
  *
- * The per-thread port allocation machinery is shared verbatim: the
- * bitmap indexes v4 pool addresses by external_idx and port slots by
- * (port - thread_port_start[t]).  NAT64 ICMP echo identifiers consume
- * entries from the same bitmap as TCP/UDP ports (both are u16). */
+ * Per-thread port bitmaps live on sfw_v4_port_alloc_t (indexed by
+ * v4_alloc_idx) so pools with the same external v4 range share them.
+ * See sfw_v4_port_alloc_t comment for why. */
 typedef struct
 {
   u8 kind; /* sfw_pool_kind_t: NAT44 or NAT64 */
@@ -96,19 +132,9 @@ typedef struct
   /* Deterministic mode parameters (NAT44 only) */
   u16 ports_per_host;
 
-  /* Dynamic mode: per-thread port ranges.
-   * The allocatable port range (1024-65535) is divided equally among
-   * workers so each thread allocates from an exclusive slice with no
-   * locking and no cross-thread collisions.
-   *   thread 0: ports 1024 .. 1024+slice-1
-   *   thread 1: ports 1024+slice .. 1024+2*slice-1
-   *   ...
-   * port_bitmaps[thread][ext_addr] tracks which ports within the
-   * thread's slice are in use. */
-  clib_bitmap_t ***port_bitmaps; /* vec[nworkers] of vec[n_ext_addrs] */
-  u32 **next_port;		  /* vec[nworkers] of vec[n_ext_addrs] */
-  u16 *thread_port_start;	  /* vec[nworkers] — first port for this thread */
-  u16 *thread_port_count;	  /* vec[nworkers] — number of ports for this thread */
+  /* Index into sm->v4_port_allocs. Shared with any other pool that
+   * uses the same external_addr/plen. */
+  u32 v4_alloc_idx;
 
   /* Computed at add time */
   u32 n_external_addrs;
@@ -164,13 +190,16 @@ typedef struct
       u16 nat_port;		/* translated port (network byte order) */
       ip4_address_t orig_addr; /* original pre-translation address */
       u16 orig_port;		/* original pre-translation port */
+      u32 v4_alloc_idx;	/* sm->v4_port_allocs index for port free
+				   (SNAT only; DNAT is static) */
     } v4;
     struct
     {
       ip4_address_t v4_pool;	/* SNAT'd v4 source (from the pool) */
       ip4_address_t v4_server; /* embedded v4 destination (extracted from v6) */
       u16 v4_pool_port;	/* allocated v4 source port / ICMP id (net order) */
-      u8 pool_idx;		/* index into sm->nat_pools for port free */
+      u8 pool_idx;		/* index into sm->nat_pools (display only) */
+      u32 v4_alloc_idx;	/* sm->v4_port_allocs index for port free */
     } n64;
   } xlate;
 
@@ -300,6 +329,11 @@ typedef struct
   /* NAT pools and static mappings */
   sfw_nat_pool_t *nat_pools;     /* vec of NAT pool configs */
   sfw_nat_static_t *nat_statics; /* vec of DNAT static mappings */
+
+  /* Shared v4 port allocators, keyed by (external_addr, external_plen).
+   * Pools reference an allocator via sfw_nat_pool_t.v4_alloc_idx;
+   * allocators are ref-counted and freed when no pool references them. */
+  sfw_v4_port_alloc_t *v4_port_allocs;
 
   /* Config parameters */
   f64 session_timeout;		/* default 120.0 seconds */
@@ -507,17 +541,25 @@ int sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
 			      ip4_address_t *src_addr, u16 src_port,
 			      u8 protocol, ip4_address_t *dst_addr,
 			      ip4_address_t *out_addr, u16 *out_port,
-			      u8 *out_mode);
+			      u8 *out_mode, u32 *out_alloc_idx);
 sfw_nat_static_t *sfw_nat_find_dnat (sfw_main_t *sm,
 				      ip4_address_t *dst_addr, u16 dst_port,
 				      u8 protocol);
 u32 sfw_ip4_addr_index (ip4_address_t *addr, ip4_address_t *base, u8 plen);
 void sfw_ip4_addr_from_index (ip4_address_t *out, ip4_address_t *base,
 			      u8 plen, u32 index);
-u16 sfw_nat_pool_alloc_port (sfw_nat_pool_t *pool, u32 thread_index,
-			     u32 external_idx);
-void sfw_nat_free_port (sfw_nat_pool_t *pool, u32 thread_index,
-			u32 external_idx, u16 port_h);
+
+/* Shared v4 port allocator — used by every NAT pool that SNATs onto
+ * a v4 external range. See sfw_v4_port_alloc_t doc in this file. */
+u32 sfw_v4_port_alloc_ref_or_create (sfw_main_t *sm, ip4_address_t *addr,
+				     u8 plen, u16 port_range_start,
+				     u16 port_range_end);
+void sfw_v4_port_alloc_unref (sfw_main_t *sm, u32 alloc_idx);
+u16 sfw_v4_port_alloc_port (sfw_main_t *sm, u32 alloc_idx, u32 thread_index,
+			    u32 external_idx);
+void sfw_v4_port_alloc_free_port (sfw_main_t *sm, u32 alloc_idx,
+				  u32 thread_index, u32 external_idx,
+				  u16 port_h);
 void sfw_nat_apply_snat (ip4_header_t *ip0, void *l4_hdr, u8 protocol,
 			 ip4_address_t *new_addr, u16 new_port);
 void sfw_nat_apply_dnat (ip4_header_t *ip0, void *l4_hdr, u8 protocol,

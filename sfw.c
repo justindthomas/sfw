@@ -903,37 +903,15 @@ sfw_nat_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (pool.ports_per_host == 0)
     pool.ports_per_host = 1;
 
-  /* Allocate per-thread port ranges for dynamic mode.
-   * Partition the port range so each thread gets an exclusive slice. */
-  if (mode == SFW_NAT_MODE_DYNAMIC)
-    {
-      sfw_feature_init (sm);
-      u32 nworkers = vlib_num_workers ();
-      u32 nthreads = nworkers + 1; /* include main thread 0 */
-      u32 slice = port_range / nthreads;
-      if (slice == 0)
-	slice = 1;
-
-      vec_validate (pool.port_bitmaps, nworkers);
-      vec_validate (pool.next_port, nworkers);
-      vec_validate (pool.thread_port_start, nworkers);
-      vec_validate (pool.thread_port_count, nworkers);
-
-      u32 t;
-      for (t = 0; t < nthreads; t++)
-	{
-	  pool.thread_port_start[t] = pool.port_range_start + (t * slice);
-	  pool.thread_port_count[t] =
-	    (t == nthreads - 1) ? (port_range - t * slice) : slice;
-
-	  vec_validate (pool.port_bitmaps[t], pool.n_external_addrs - 1);
-	  vec_validate_init_empty (pool.next_port[t],
-				   pool.n_external_addrs - 1, 0);
-	  u32 a;
-	  for (a = 0; a < pool.n_external_addrs; a++)
-	    pool.port_bitmaps[t][a] = 0; /* all clear = all free */
-	}
-    }
+  /* Reference (or create) the shared v4 port allocator for this
+   * external range, for dynamic mode. Deterministic mode doesn't
+   * use the allocator but we still ref one so unref logic is
+   * symmetric and so a later overlap with a dynamic pool still
+   * shares state. */
+  sfw_feature_init (sm);
+  pool.v4_alloc_idx = sfw_v4_port_alloc_ref_or_create (
+    sm, &pool.external_addr, pool.external_plen, pool.port_range_start,
+    pool.port_range_end);
 
   vec_add1 (sm->nat_pools, pool);
 
@@ -1014,29 +992,9 @@ sfw_nat64_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
       pool.n_internal_addrs = 0; /* unused for NAT64 */
 
       sfw_feature_init (sm);
-      u32 nworkers = vlib_num_workers ();
-      u32 nthreads = nworkers + 1;
-      u32 port_range = pool.port_range_end - pool.port_range_start + 1;
-      u32 slice = port_range / nthreads;
-      if (slice == 0)
-	slice = 1;
-
-      vec_validate (pool.port_bitmaps, nworkers);
-      vec_validate (pool.next_port, nworkers);
-      vec_validate (pool.thread_port_start, nworkers);
-      vec_validate (pool.thread_port_count, nworkers);
-
-      for (u32 t = 0; t < nthreads; t++)
-	{
-	  pool.thread_port_start[t] = pool.port_range_start + (t * slice);
-	  pool.thread_port_count[t] =
-	    (t == nthreads - 1) ? (port_range - t * slice) : slice;
-	  vec_validate (pool.port_bitmaps[t], pool.n_external_addrs - 1);
-	  vec_validate_init_empty (pool.next_port[t],
-				   pool.n_external_addrs - 1, 0);
-	  for (u32 a = 0; a < pool.n_external_addrs; a++)
-	    pool.port_bitmaps[t][a] = 0;
-	}
+      pool.v4_alloc_idx = sfw_v4_port_alloc_ref_or_create (
+	sm, &pool.external_addr, pool.external_plen, pool.port_range_start,
+	pool.port_range_end);
 
       vec_add1 (sm->nat_pools, pool);
       vlib_cli_output (vm, "NAT64 pool added: %U/%u (v4 pool) <- %U/%u (v6)",
@@ -1058,14 +1016,7 @@ sfw_nat64_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	      clib_memcmp (&p->nat64_prefix, &nat64_prefix,
 			   sizeof (ip6_address_t)) == 0)
 	    {
-	      for (u32 t = 0; t < vec_len (p->port_bitmaps); t++)
-		vec_free (p->port_bitmaps[t]);
-	      vec_free (p->port_bitmaps);
-	      for (u32 t = 0; t < vec_len (p->next_port); t++)
-		vec_free (p->next_port[t]);
-	      vec_free (p->next_port);
-	      vec_free (p->thread_port_start);
-	      vec_free (p->thread_port_count);
+	      sfw_v4_port_alloc_unref (sm, p->v4_alloc_idx);
 	      vec_delete (sm->nat_pools, 1, i);
 	      matched = 1;
 	      break;
@@ -1110,15 +1061,20 @@ sfw_show_nat64_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		       format_ip4_address, &p->external_addr, p->external_plen,
 		       format_ip6_address, &p->nat64_prefix,
 		       p->nat64_prefix_len);
-      if (p->port_bitmaps)
+      if (!pool_is_free_index (sm->v4_port_allocs, p->v4_alloc_idx))
 	{
-	  for (u32 t = 0; t < vec_len (p->thread_port_count); t++)
+	  sfw_v4_port_alloc_t *a =
+	    pool_elt_at_index (sm->v4_port_allocs, p->v4_alloc_idx);
+	  vlib_cli_output (vm,
+			   "    port allocator [%u] refs=%u",
+			   p->v4_alloc_idx, a->ref_count);
+	  for (u32 t = 0; t < vec_len (a->thread_port_count); t++)
 	    vlib_cli_output (vm,
-			     "    thread %u: port_start=%u count=%u "
+			     "      thread %u: port_start=%u count=%u "
 			     "bitmaps=%s",
-			     t, p->thread_port_start[t],
-			     p->thread_port_count[t],
-			     p->port_bitmaps[t] ? "allocated" : "NULL");
+			     t, a->thread_port_start[t],
+			     a->thread_port_count[t],
+			     a->port_bitmaps[t] ? "allocated" : "NULL");
 	}
     }
   return 0;
@@ -1334,19 +1290,22 @@ sfw_show_nat_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			   p->external_plen, format_ip4_address,
 			   &p->internal_addr, p->internal_plen,
 			   mode_names[p->mode]);
-	  if (p->port_bitmaps)
+	  if (!pool_is_free_index (sm->v4_port_allocs, p->v4_alloc_idx))
 	    {
-	      u32 t;
-	      for (t = 0; t < vec_len (p->thread_port_count); t++)
+	      sfw_v4_port_alloc_t *a =
+		pool_elt_at_index (sm->v4_port_allocs, p->v4_alloc_idx);
+	      vlib_cli_output (vm, "    port allocator [%u] refs=%u",
+			       p->v4_alloc_idx, a->ref_count);
+	      for (u32 t = 0; t < vec_len (a->thread_port_count); t++)
 		vlib_cli_output (vm,
-				 "    thread %u: port_start=%u count=%u "
+				 "      thread %u: port_start=%u count=%u "
 				 "bitmaps=%s",
-				 t, p->thread_port_start[t],
-				 p->thread_port_count[t],
-				 p->port_bitmaps[t] ? "allocated" : "NULL");
+				 t, a->thread_port_start[t],
+				 a->thread_port_count[t],
+				 a->port_bitmaps[t] ? "allocated" : "NULL");
 	    }
 	  else
-	    vlib_cli_output (vm, "    port_bitmaps: NOT ALLOCATED");
+	    vlib_cli_output (vm, "    port allocator: NONE");
 	}
     }
 

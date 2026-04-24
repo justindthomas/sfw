@@ -76,21 +76,94 @@ sfw_nat_det_translate (sfw_nat_pool_t *pool, ip4_address_t *internal_addr,
   return 0;
 }
 
-/* --- Dynamic NAT port mapping --- */
+/* --- Shared v4 port allocator ---
+ *
+ * Extracted from sfw_nat_pool_t so pools with overlapping external
+ * v4 ranges can share a single bitmap. See sfw.h for the rationale.
+ * The per-thread slicing strategy is unchanged: each worker gets an
+ * exclusive port range so no locking is needed on the hot path.
+ */
 
-/* Allocate a port from this thread's exclusive slice of the port range.
- * Returns the allocated port in host byte order, or 0 on exhaustion.
- * Exposed for NAT64 which needs to allocate v4 pool ports independently. */
-u16
-sfw_nat_pool_alloc_port (sfw_nat_pool_t *pool, u32 thread_index,
-			 u32 external_idx)
+u32
+sfw_v4_port_alloc_ref_or_create (sfw_main_t *sm, ip4_address_t *addr,
+				 u8 plen, u16 port_range_start,
+				 u16 port_range_end)
 {
-  u16 count = pool->thread_port_count[thread_index];
+  sfw_v4_port_alloc_t *a;
+  pool_foreach (a, sm->v4_port_allocs)
+    {
+      if (a->external_addr.as_u32 == addr->as_u32 &&
+	  a->external_plen == plen)
+	{
+	  a->ref_count++;
+	  return a - sm->v4_port_allocs;
+	}
+    }
+
+  pool_get_zero (sm->v4_port_allocs, a);
+  a->external_addr = *addr;
+  a->external_plen = plen;
+  a->n_external_addrs = (plen < 32) ? (1u << (32 - plen)) : 1;
+  a->port_range_start = port_range_start;
+  a->port_range_end = port_range_end;
+
+  u32 nworkers = vlib_num_workers ();
+  u32 nthreads = nworkers + 1;
+  u32 port_range = (u32) port_range_end - (u32) port_range_start + 1;
+  u32 slice = port_range / nthreads;
+  if (slice == 0)
+    slice = 1;
+
+  vec_validate (a->port_bitmaps, nworkers);
+  vec_validate (a->next_port, nworkers);
+  vec_validate (a->thread_port_start, nworkers);
+  vec_validate (a->thread_port_count, nworkers);
+
+  for (u32 t = 0; t < nthreads; t++)
+    {
+      a->thread_port_start[t] = port_range_start + (t * slice);
+      a->thread_port_count[t] =
+	(t == nthreads - 1) ? (port_range - t * slice) : slice;
+      vec_validate (a->port_bitmaps[t], a->n_external_addrs - 1);
+      vec_validate_init_empty (a->next_port[t], a->n_external_addrs - 1, 0);
+      for (u32 x = 0; x < a->n_external_addrs; x++)
+	a->port_bitmaps[t][x] = 0;
+    }
+
+  a->ref_count = 1;
+  return a - sm->v4_port_allocs;
+}
+
+void
+sfw_v4_port_alloc_unref (sfw_main_t *sm, u32 alloc_idx)
+{
+  sfw_v4_port_alloc_t *a = pool_elt_at_index (sm->v4_port_allocs, alloc_idx);
+  if (--a->ref_count > 0)
+    return;
+
+  for (u32 t = 0; t < vec_len (a->port_bitmaps); t++)
+    vec_free (a->port_bitmaps[t]);
+  vec_free (a->port_bitmaps);
+  for (u32 t = 0; t < vec_len (a->next_port); t++)
+    vec_free (a->next_port[t]);
+  vec_free (a->next_port);
+  vec_free (a->thread_port_start);
+  vec_free (a->thread_port_count);
+
+  pool_put (sm->v4_port_allocs, a);
+}
+
+u16
+sfw_v4_port_alloc_port (sfw_main_t *sm, u32 alloc_idx, u32 thread_index,
+			u32 external_idx)
+{
+  sfw_v4_port_alloc_t *a = pool_elt_at_index (sm->v4_port_allocs, alloc_idx);
+  u16 count = a->thread_port_count[thread_index];
   if (count == 0)
     return 0;
 
-  clib_bitmap_t **bm = &pool->port_bitmaps[thread_index][external_idx];
-  u32 hint = pool->next_port[thread_index][external_idx];
+  clib_bitmap_t **bm = &a->port_bitmaps[thread_index][external_idx];
+  u32 hint = a->next_port[thread_index][external_idx];
 
   /* Search for a free bit starting from the hint */
   uword bit = clib_bitmap_next_clear (*bm, hint);
@@ -102,26 +175,26 @@ sfw_nat_pool_alloc_port (sfw_nat_pool_t *pool, u32 thread_index,
     }
 
   *bm = clib_bitmap_set (*bm, bit, 1);
-  pool->next_port[thread_index][external_idx] = (bit + 1) % count;
-  return pool->thread_port_start[thread_index] + (u16) bit;
+  a->next_port[thread_index][external_idx] = (bit + 1) % count;
+  return a->thread_port_start[thread_index] + (u16) bit;
 }
 
-/* Free a previously allocated port back to the bitmap. */
 void
-sfw_nat_free_port (sfw_nat_pool_t *pool, u32 thread_index,
-		   u32 external_idx, u16 port_h)
+sfw_v4_port_alloc_free_port (sfw_main_t *sm, u32 alloc_idx, u32 thread_index,
+			     u32 external_idx, u16 port_h)
 {
-  u16 start = pool->thread_port_start[thread_index];
+  sfw_v4_port_alloc_t *a = pool_elt_at_index (sm->v4_port_allocs, alloc_idx);
+  u16 start = a->thread_port_start[thread_index];
   u32 bit = port_h - start;
-  pool->port_bitmaps[thread_index][external_idx] =
-    clib_bitmap_set (pool->port_bitmaps[thread_index][external_idx], bit, 0);
+  a->port_bitmaps[thread_index][external_idx] =
+    clib_bitmap_set (a->port_bitmaps[thread_index][external_idx], bit, 0);
 }
 
 static int
-sfw_nat_dynamic_translate (sfw_nat_pool_t *pool, u32 thread_index,
-			   ip4_address_t *internal_addr, u16 internal_port,
-			   u8 protocol, ip4_address_t *out_external,
-			   u16 *out_port)
+sfw_nat_dynamic_translate (sfw_main_t *sm, sfw_nat_pool_t *pool,
+			   u32 thread_index, ip4_address_t *internal_addr,
+			   u16 internal_port, u8 protocol,
+			   ip4_address_t *out_external, u16 *out_port)
 {
   /* Hash the source tuple to select a preferred external address */
   u32 hash = internal_addr->as_u32 ^ ((u32) internal_port << 16) ^
@@ -135,8 +208,8 @@ sfw_nat_dynamic_translate (sfw_nat_pool_t *pool, u32 thread_index,
   for (attempt = 0; attempt < n; attempt++)
     {
       u32 external_idx = (preferred_idx + attempt) % n;
-      u16 port =
-	sfw_nat_pool_alloc_port (pool, thread_index, external_idx);
+      u16 port = sfw_v4_port_alloc_port (sm, pool->v4_alloc_idx,
+					 thread_index, external_idx);
       if (port != 0)
 	{
 	  sfw_ip4_addr_from_index (out_external, &pool->external_addr,
@@ -155,7 +228,7 @@ int
 sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
 			  ip4_address_t *src_addr, u16 src_port, u8 protocol,
 			  ip4_address_t *dst_addr, ip4_address_t *out_addr,
-			  u16 *out_port, u8 *out_mode)
+			  u16 *out_port, u8 *out_mode, u32 *out_alloc_idx)
 {
   u32 i;
 
@@ -200,13 +273,14 @@ sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
 	return -1;
 
       *out_mode = pool->mode;
+      *out_alloc_idx = pool->v4_alloc_idx;
       switch (pool->mode)
 	{
 	case SFW_NAT_MODE_DETERMINISTIC:
 	  return sfw_nat_det_translate (pool, src_addr, src_port, protocol,
 					out_addr, out_port);
 	case SFW_NAT_MODE_DYNAMIC:
-	  return sfw_nat_dynamic_translate (pool, thread_index, src_addr,
+	  return sfw_nat_dynamic_translate (sm, pool, thread_index, src_addr,
 					    src_port, protocol, out_addr,
 					    out_port);
 	}

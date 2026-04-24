@@ -165,57 +165,43 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
 	clib_warning ("sfw: NAT64 v4-return hash delete failed (rv=%d)", rv);
     }
 
-  /* Free the allocated port back to the bitmap for dynamic SNAT sessions */
+  /* Free the allocated port back to the shared v4 port allocator.
+   * The allocator lives on sm->v4_port_allocs; the session stored
+   * its index (xlate.v4.v4_alloc_idx or xlate.n64.v4_alloc_idx) at
+   * create time. The allocator keys bitmaps by external_addr +
+   * external_idx within its range, so we need to map the session's
+   * v4 pool address back to an external_idx against the allocator's
+   * base address. */
   if (s->nat_type == SFW_NAT_SNAT)
     {
-      u16 port_h = clib_net_to_host_u16 (s->xlate.v4.nat_port);
-      u32 i;
-      for (i = 0; i < vec_len (sm->nat_pools); i++)
+      u32 alloc_idx = s->xlate.v4.v4_alloc_idx;
+      if (!pool_is_free_index (sm->v4_port_allocs, alloc_idx))
 	{
-	  sfw_nat_pool_t *pool = &sm->nat_pools[i];
-	  if (pool->kind != SFW_POOL_KIND_NAT44)
-	    continue;
-	  if (pool->mode != SFW_NAT_MODE_DYNAMIC || !pool->port_bitmaps)
-	    continue;
-	  /* Check if the NAT address belongs to this pool */
-	  if (pool->n_external_addrs == 1 &&
-	      pool->external_addr.as_u32 == s->xlate.v4.nat_addr.as_u32)
-	    {
-	      sfw_nat_free_port (pool, s->thread_index, 0, port_h);
-	      break;
-	    }
-	  else if (pool->n_external_addrs > 1)
-	    {
-	      u32 ext_idx = sfw_ip4_addr_index (&s->xlate.v4.nat_addr,
-						 &pool->external_addr,
-						 pool->external_plen);
-	      if (ext_idx < pool->n_external_addrs)
-		{
-		  sfw_nat_free_port (pool, s->thread_index, ext_idx, port_h);
-		  break;
-		}
-	    }
+	  sfw_v4_port_alloc_t *a =
+	    pool_elt_at_index (sm->v4_port_allocs, alloc_idx);
+	  u32 ext_idx = sfw_ip4_addr_index (&s->xlate.v4.nat_addr,
+					    &a->external_addr,
+					    a->external_plen);
+	  if (ext_idx < a->n_external_addrs)
+	    sfw_v4_port_alloc_free_port (
+	      sm, alloc_idx, s->thread_index, ext_idx,
+	      clib_net_to_host_u16 (s->xlate.v4.nat_port));
 	}
     }
-  /* Free the allocated v4 pool port for NAT64 sessions. pool_idx is
-   * stored directly on the session, so no scan needed. */
   else if (s->nat_type == SFW_NAT_NAT64)
     {
-      if (s->xlate.n64.pool_idx < vec_len (sm->nat_pools))
+      u32 alloc_idx = s->xlate.n64.v4_alloc_idx;
+      if (!pool_is_free_index (sm->v4_port_allocs, alloc_idx))
 	{
-	  sfw_nat_pool_t *pool = &sm->nat_pools[s->xlate.n64.pool_idx];
-	  if (pool->kind == SFW_POOL_KIND_NAT64 && pool->port_bitmaps)
-	    {
-	      u32 ext_idx = sfw_ip4_addr_index (&s->xlate.n64.v4_pool,
-						 &pool->external_addr,
-						 pool->external_plen);
-	      if (ext_idx < pool->n_external_addrs)
-		{
-		  u16 port_h =
-		    clib_net_to_host_u16 (s->xlate.n64.v4_pool_port);
-		  sfw_nat_free_port (pool, s->thread_index, ext_idx, port_h);
-		}
-	    }
+	  sfw_v4_port_alloc_t *a =
+	    pool_elt_at_index (sm->v4_port_allocs, alloc_idx);
+	  u32 ext_idx = sfw_ip4_addr_index (&s->xlate.n64.v4_pool,
+					    &a->external_addr,
+					    a->external_plen);
+	  if (ext_idx < a->n_external_addrs)
+	    sfw_v4_port_alloc_free_port (
+	      sm, alloc_idx, s->thread_index, ext_idx,
+	      clib_net_to_host_u16 (s->xlate.n64.v4_pool_port));
 	}
     }
 }

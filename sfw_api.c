@@ -281,22 +281,13 @@ done:
 
 /* --- sfw_nat_pool_add_del --- */
 
-/* Helpers that tear down the per-thread port bookkeeping allocated
- * by dynamic-mode pools. Mirror of the vec_validate layout in the
- * add path. Safe to call on a deterministic-mode pool (vecs are
- * empty). */
+/* Release this pool's reference to its shared v4 port allocator.
+ * The allocator is freed only when the last pool referencing it
+ * is deleted. */
 static void
-sfw_nat_pool_free_internals (sfw_nat_pool_t *pool)
+sfw_nat_pool_free_internals (sfw_main_t *sm, sfw_nat_pool_t *pool)
 {
-  u32 t;
-  for (t = 0; t < vec_len (pool->port_bitmaps); t++)
-    vec_free (pool->port_bitmaps[t]);
-  vec_free (pool->port_bitmaps);
-  for (t = 0; t < vec_len (pool->next_port); t++)
-    vec_free (pool->next_port[t]);
-  vec_free (pool->next_port);
-  vec_free (pool->thread_port_start);
-  vec_free (pool->thread_port_count);
+  sfw_v4_port_alloc_unref (sm, pool->v4_alloc_idx);
 }
 
 static void
@@ -352,35 +343,14 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
       if (pool.ports_per_host == 0)
 	pool.ports_per_host = 1;
 
-      if (mp->mode == SFW_NAT_MODE_DYNAMIC)
-	{
-	  sfw_feature_init (sm);
-	  u32 nworkers = vlib_num_workers ();
-	  u32 nthreads = nworkers + 1;
-	  u32 slice = port_range / nthreads;
-	  if (slice == 0)
-	    slice = 1;
-
-	  vec_validate (pool.port_bitmaps, nworkers);
-	  vec_validate (pool.next_port, nworkers);
-	  vec_validate (pool.thread_port_start, nworkers);
-	  vec_validate (pool.thread_port_count, nworkers);
-
-	  u32 t;
-	  for (t = 0; t < nthreads; t++)
-	    {
-	      pool.thread_port_start[t] = pool.port_range_start + (t * slice);
-	      pool.thread_port_count[t] =
-		(t == nthreads - 1) ? (port_range - t * slice) : slice;
-
-	      vec_validate (pool.port_bitmaps[t], pool.n_external_addrs - 1);
-	      vec_validate_init_empty (pool.next_port[t],
-				       pool.n_external_addrs - 1, 0);
-	      u32 a;
-	      for (a = 0; a < pool.n_external_addrs; a++)
-		pool.port_bitmaps[t][a] = 0;
-	    }
-	}
+      /* Ref the shared v4 port allocator for this external range;
+       * creates one if no other pool already owns it. (void) port_range
+       * — pool.port_range_{start,end} carry those values now. */
+      (void) port_range;
+      sfw_feature_init (sm);
+      pool.v4_alloc_idx = sfw_v4_port_alloc_ref_or_create (
+	sm, &pool.external_addr, pool.external_plen, pool.port_range_start,
+	pool.port_range_end);
 
       vec_add1 (sm->nat_pools, pool);
     }
@@ -400,7 +370,7 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 	      p->internal_addr.as_u32 == int_addr.as_u32 &&
 	      p->internal_plen == int_plen)
 	    {
-	      sfw_nat_pool_free_internals (p);
+	      sfw_nat_pool_free_internals (sm, p);
 	      vec_delete (sm->nat_pools, 1, i);
 	      matched = 1;
 	      break;
@@ -469,29 +439,9 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
 	(ext_plen < 32) ? (1u << (32 - ext_plen)) : 1;
 
       sfw_feature_init (sm);
-      u32 nworkers = vlib_num_workers ();
-      u32 nthreads = nworkers + 1;
-      u32 port_range = pool.port_range_end - pool.port_range_start + 1;
-      u32 slice = port_range / nthreads;
-      if (slice == 0)
-	slice = 1;
-
-      vec_validate (pool.port_bitmaps, nworkers);
-      vec_validate (pool.next_port, nworkers);
-      vec_validate (pool.thread_port_start, nworkers);
-      vec_validate (pool.thread_port_count, nworkers);
-
-      for (u32 t = 0; t < nthreads; t++)
-	{
-	  pool.thread_port_start[t] = pool.port_range_start + (t * slice);
-	  pool.thread_port_count[t] =
-	    (t == nthreads - 1) ? (port_range - t * slice) : slice;
-	  vec_validate (pool.port_bitmaps[t], pool.n_external_addrs - 1);
-	  vec_validate_init_empty (pool.next_port[t],
-				   pool.n_external_addrs - 1, 0);
-	  for (u32 a = 0; a < pool.n_external_addrs; a++)
-	    pool.port_bitmaps[t][a] = 0;
-	}
+      pool.v4_alloc_idx = sfw_v4_port_alloc_ref_or_create (
+	sm, &pool.external_addr, pool.external_plen, pool.port_range_start,
+	pool.port_range_end);
 
       vec_add1 (sm->nat_pools, pool);
     }
@@ -509,7 +459,7 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
 	      clib_memcmp (&p->nat64_prefix, &v6_prefix,
 			   sizeof (ip6_address_t)) == 0)
 	    {
-	      sfw_nat_pool_free_internals (p);
+	      sfw_nat_pool_free_internals (sm, p);
 	      vec_delete (sm->nat_pools, 1, i);
 	      matched = 1;
 	      break;

@@ -293,6 +293,9 @@ typedef struct
   u8 icmp_code;
   u8 nat_computed; /* 0=none, 1=SNAT, 2=DNAT */
   u8 nat_mode;	   /* sfw_nat_mode_t — set during pass 1 NAT translation */
+  u32 nat_alloc_idx; /* sm->v4_port_allocs index selected for SNAT;
+			  stamped on the session so sfw_session_unhash
+			  can free the allocated port. */
   u8 nat64_return; /* 1 if matched session has nat_type == SFW_NAT_NAT64
 		      and needs v4->v6 rewrite in pass 2 */
 } sfw_pkt_meta_t;
@@ -558,7 +561,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  if (sfw_nat_translate_source (
 		sm, thread_index, &ip0->src_address, m->src_port,
 		m->protocol, &ip0->dst_address, &m->nat_addr,
-		&m->nat_port, &m->nat_mode) == 0)
+		&m->nat_port, &m->nat_mode, &m->nat_alloc_idx) == 0)
 	    {
 	      if (m->protocol == IP_PROTOCOL_ICMP)
 		m->nat_port = m->src_port;
@@ -787,6 +790,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  s->xlate.v4.nat_port = m->nat_port;
 		  s->xlate.v4.orig_addr = ip0->src_address;
 		  s->xlate.v4.orig_port = m->src_port;
+		  s->xlate.v4.v4_alloc_idx = m->nat_alloc_idx;
 
 		  u64 enc = sfw_session_encode (
 		    thread_index, s - sm->sessions[thread_index]);
@@ -1198,8 +1202,8 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  for (u32 attempt = 0; attempt < n; attempt++)
 	    {
 	      external_idx = (preferred + attempt) % n;
-	      port_h =
-		sfw_nat_pool_alloc_port (pool, thread_index, external_idx);
+	      port_h = sfw_v4_port_alloc_port (sm, pool->v4_alloc_idx,
+					       thread_index, external_idx);
 	      if (port_h != 0)
 		break;
 	    }
@@ -1281,6 +1285,8 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      s->xlate.n64.v4_server = m->nat64_v4_server;
 	      s->xlate.n64.v4_pool_port = m->nat64_v4_pool_port;
 	      s->xlate.n64.pool_idx = m->nat64_pool_idx;
+	      s->xlate.n64.v4_alloc_idx =
+		sm->nat_pools[m->nat64_pool_idx].v4_alloc_idx;
 
 	      u64 enc = sfw_session_encode (
 		thread_index, s - sm->sessions[thread_index]);
@@ -1348,8 +1354,8 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  u32 ext_idx = sfw_ip4_addr_index (&m->nat64_v4_pool,
 						     &p->external_addr,
 						     p->external_plen);
-		  sfw_nat_free_port (
-		    p, thread_index, ext_idx,
+		  sfw_v4_port_alloc_free_port (
+		    sm, p->v4_alloc_idx, thread_index, ext_idx,
 		    clib_net_to_host_u16 (m->nat64_v4_pool_port));
 		  nexts[i] = SFW_NEXT_DROP;
 		}
@@ -1361,8 +1367,8 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      u32 ext_idx =
 		sfw_ip4_addr_index (&m->nat64_v4_pool, &p->external_addr,
 				    p->external_plen);
-	      sfw_nat_free_port (
-		p, thread_index, ext_idx,
+	      sfw_v4_port_alloc_free_port (
+		sm, p->v4_alloc_idx, thread_index, ext_idx,
 		clib_net_to_host_u16 (m->nat64_v4_pool_port));
 	    }
 	}
