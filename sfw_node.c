@@ -1115,9 +1115,16 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       m->policy = policy;
       m->is_from_zone = is_from_zone;
 
-      /* Implicit ICMPv6 permit */
+      /* Implicit ICMPv6 permit — stateless passthrough for NDP,
+       * PMTUD, and echo, so those don't need explicit rules. But
+       * NOT for packets destined to a configured NAT64 prefix:
+       * those need the NAT64 translation path. Without this
+       * guard, ping6 64:ff9b::<v4> bypassed NAT64, got forwarded
+       * as plain v6 towards a destination that isn't globally
+       * routable, and produced no reply. */
       if (m->protocol == IP_PROTOCOL_ICMP6 && policy->implicit_icmpv6 &&
-	  sfw_is_implicit_icmpv6 (m->icmp_type))
+	  sfw_is_implicit_icmpv6 (m->icmp_type) &&
+	  sfw_nat64_match_pool (sm, &ip0->dst_address) == ~0u)
 	{
 	  permitted++;
 	  continue;
