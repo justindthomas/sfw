@@ -1134,25 +1134,34 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	clib_net_to_host_u16 (m->dst_port), m->icmp_type, m->icmp_code);
 
       /* NAT64 pool match for PERMIT_STATEFUL_NAT flows.
-       * Only TCP/UDP/ICMPv6 are translatable; silently drop other
-       * protocols (IPsec, SCTP, etc.) through the untranslatable
-       * counter below. */
+       *
+       * The rule match already decided "permit" — this branch just
+       * layers NAT64 on top when possible. When we can't do NAT64
+       * (non-translatable protocol, or no NAT64 pool covers the v6
+       * dst), fall back to PERMIT_STATEFUL rather than denying: a
+       * single zone-pair policy with `default-action
+       * permit-stateful-nat` naturally covers both v4 SNAT and
+       * v6 pass-through-with-state, which is what operators
+       * commonly want. Deny decisions come from rules, not from
+       * NAT64 failure.
+       *
+       * The NAT64_UNKNOWN_PREFIX counter still increments so
+       * operators who *do* intend NAT64 can spot v6 traffic that
+       * isn't being translated because no pool matches. */
       if (m->action == SFW_ACTION_PERMIT_STATEFUL_NAT)
 	{
 	  if (m->protocol != IP_PROTOCOL_TCP &&
 	      m->protocol != IP_PROTOCOL_UDP &&
 	      m->protocol != IP_PROTOCOL_ICMP6)
 	    {
-	      m->action = SFW_ACTION_DENY;
+	      m->action = SFW_ACTION_PERMIT_STATEFUL;
 	      continue;
 	    }
 
 	  u32 pool_idx = sfw_nat64_match_pool (sm, &ip0->dst_address);
 	  if (pool_idx == ~0u)
 	    {
-	      /* Policy permits NAT but dst isn't in any configured
-	       * NAT64 prefix — misconfiguration. Drop loudly. */
-	      m->action = SFW_ACTION_DENY;
+	      m->action = SFW_ACTION_PERMIT_STATEFUL;
 	      vlib_node_increment_counter (vm, node->node_index,
 					   SFW_ERROR_NAT64_UNKNOWN_PREFIX, 1);
 	      continue;
@@ -1164,7 +1173,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 				    pool->nat64_prefix_len,
 				    &ip0->dst_address, &v4_dst) != 0)
 	    {
-	      m->action = SFW_ACTION_DENY;
+	      m->action = SFW_ACTION_PERMIT_STATEFUL;
 	      vlib_node_increment_counter (vm, node->node_index,
 					   SFW_ERROR_NAT64_UNKNOWN_PREFIX, 1);
 	      continue;

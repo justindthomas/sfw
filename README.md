@@ -415,8 +415,11 @@ vppctl show errors | grep -i nat64
 `show sfw sessions` prints NAT64 sessions with both the v6 tuple (in
 the session key) and the v4 side (`xlate.n64.v4_pool:port ->
 xlate.n64.v4_server`). Error counters cover successful translations
-(`NAT64_V6_TO_V4`, `NAT64_V4_TO_V6`), misconfigured dst prefix
-(`NAT64_UNKNOWN_PREFIX`), buffer headroom shortage on v4→v6 growth
+(`NAT64_V6_TO_V4`, `NAT64_V4_TO_V6`), v6 flows hitting
+`permit-stateful-nat` that fell through to plain `permit-stateful`
+because no NAT64 pool matched the destination (`NAT64_UNKNOWN_PREFIX`
+— informational; operators who *do* expect translation should
+configure a matching pool), buffer headroom shortage on v4→v6 growth
 (`NAT64_HEADROOM`), and untranslatable ICMP (`NAT64_ICMP_UNSUPPORTED`).
 
 **Known limitations**
