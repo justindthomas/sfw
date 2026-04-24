@@ -178,12 +178,14 @@ typedef struct
 {
   ip4_address_t new_src; /* v4 pool address (session->xlate.n64.v4_pool) */
   ip4_address_t new_dst; /* embedded v4 dst (session->xlate.n64.v4_server) */
+  sfw_session_t *session;
 } sfw_nat64_v6_to_v4_ctx_t;
 
 typedef struct
 {
   ip6_address_t new_src; /* prefix::v4_server (re-embedded) */
   ip6_address_t new_dst; /* v6 client (k6.dst) */
+  sfw_session_t *session;
 } sfw_nat64_v4_to_v6_ctx_t;
 
 static int
@@ -195,16 +197,64 @@ sfw_nat64_v6_to_v4_outer_cb (ip6_header_t *ip6, ip4_header_t *ip4, void *arg)
   return 0;
 }
 
-/* For inner ICMP errors, the embedded packet is the v6-side copy of the
- * original outbound. From the remote's POV it was addressed to the v4
- * server; so inner src = v4_pool (our translated src) and inner dst =
- * v4_server (the remote itself). Mirrors the outer translation. */
+/* Inner packet of an ICMP error is the *original* datagram that caused
+ * the error. In almost all real-world cases (PMTUD, TTL exceeded, port
+ * unreachable replies, etc.) the inner datagram travels in the reverse
+ * direction of the outer error — the error reporter received the
+ * datagram and is complaining back to its sender. So the inner's v6
+ * src was the outer's v6 dst (the v4 server, via the NAT64 prefix)
+ * and the inner's v6 dst was the outer's v6 src (the v6 client).
+ * Translating that inner to v4: src = v4_server, dst = v4_pool, and the
+ * inner's L4 destination port (which in v6 form was the v6 client's
+ * original source port, stored as session->k6.dst_port) translates
+ * to the allocated v4 pool port. We also rewrite the inner L4
+ * checksum for the port change; the helper will layer its own
+ * pseudo-header (address) delta on top afterwards. */
 static int
 sfw_nat64_v6_to_v4_inner_cb (ip6_header_t *ip6, ip4_header_t *ip4, void *arg)
 {
   sfw_nat64_v6_to_v4_ctx_t *ctx = arg;
-  ip4->src_address = ctx->new_src;
-  ip4->dst_address = ctx->new_dst;
+  ip4->src_address = ctx->new_dst;
+  ip4->dst_address = ctx->new_src;
+
+  /* Rewrite inner L4 port/id. Assumes no inner extension headers —
+   * true for the vast majority of real traffic. L4 lives immediately
+   * after the v6 header. */
+  u8 inner_proto = ip6->protocol;
+  void *l4 = (u8 *) ip6 + sizeof (ip6_header_t);
+  u16 new_dport = ctx->session->xlate.n64.v4_pool_port;
+
+  if (inner_proto == IP_PROTOCOL_TCP)
+    {
+      tcp_header_t *tcp = (tcp_header_t *) l4;
+      u16 old = tcp->dst_port;
+      tcp->dst_port = new_dport;
+      ip_csum_t csum = tcp->checksum;
+      csum =
+	ip_csum_update (csum, old, new_dport, tcp_header_t, dst_port);
+      tcp->checksum = ip_csum_fold (csum);
+    }
+  else if (inner_proto == IP_PROTOCOL_UDP)
+    {
+      udp_header_t *udp = (udp_header_t *) l4;
+      u16 old = udp->dst_port;
+      udp->dst_port = new_dport;
+      if (udp->checksum != 0)
+	{
+	  ip_csum_t csum = udp->checksum;
+	  csum =
+	    ip_csum_update (csum, old, new_dport, udp_header_t, dst_port);
+	  udp->checksum = ip_csum_fold (csum);
+	}
+    }
+  else if (inner_proto == IP_PROTOCOL_ICMP6)
+    {
+      /* Inner ICMPv6 echo: translate the id. The helper will fully
+       * recompute the inner ICMP checksum after we return. */
+      icmp46_header_t *icmp = (icmp46_header_t *) l4;
+      if (icmp->type == ICMP6_echo_request || icmp->type == ICMP6_echo_reply)
+	((u16 *) icmp)[2] = new_dport;
+    }
   return 0;
 }
 
@@ -223,15 +273,57 @@ sfw_nat64_v4_to_v6_inner_cb (vlib_buffer_t *b, ip4_header_t *ip4,
 			     ip6_header_t *ip6, void *arg)
 {
   sfw_nat64_v4_to_v6_ctx_t *ctx = arg;
-  /* Inner direction is reversed: the embedded packet in an ICMP error
-   * was an outgoing packet from the remote's POV, meaning our client's
-   * traffic translated back to v6. Inner src = v6 client (from their
-   * POV they sent *to* the v4 server). For the outer ICMP error, the
-   * v4 layer had src = server, dst = pool; the inner embedded packet
-   * had src = pool, dst = server. Translating back means inner v6
-   * src = prefix::server, inner v6 dst = v6_client. */
+  /* Inner direction is reversed from outer: the inner packet in an
+   * ICMP error is the original packet that caused the error, which
+   * went in the opposite direction. For outer v4 src=v4_server,
+   * dst=v4_pool (an error complaining about what we sent), the inner
+   * was the original packet v4_pool -> v4_server. Translating back
+   * to v6: inner src = v6_client, inner dst = prefix::v4_server.
+   *
+   * The outer new_src here is prefix::v4_server (built from the
+   * session in translate_v4_to_v6) and new_dst is v6_client, so we
+   * assign inner src = new_dst (v6_client), inner dst = new_src
+   * (prefix::v4_server). */
   ip6_address_copy (&ip6->src_address, &ctx->new_dst);
   ip6_address_copy (&ip6->dst_address, &ctx->new_src);
+
+  /* Rewrite inner L4 source port back to the original v6 client port.
+   * The original v4 inner had sport = v4_pool_port (our allocated
+   * translated port); in the v6 form it should be the client's
+   * original source port, stored as session->k6.dst_port. */
+  u8 inner_proto = ip4->protocol;
+  void *l4 = (u8 *) ip4 + sizeof (ip4_header_t);
+  u16 new_sport = ctx->session->k6.dst_port;
+
+  if (inner_proto == IP_PROTOCOL_TCP)
+    {
+      tcp_header_t *tcp = (tcp_header_t *) l4;
+      u16 old = tcp->src_port;
+      tcp->src_port = new_sport;
+      ip_csum_t csum = tcp->checksum;
+      csum =
+	ip_csum_update (csum, old, new_sport, tcp_header_t, src_port);
+      tcp->checksum = ip_csum_fold (csum);
+    }
+  else if (inner_proto == IP_PROTOCOL_UDP)
+    {
+      udp_header_t *udp = (udp_header_t *) l4;
+      u16 old = udp->src_port;
+      udp->src_port = new_sport;
+      if (udp->checksum != 0)
+	{
+	  ip_csum_t csum = udp->checksum;
+	  csum =
+	    ip_csum_update (csum, old, new_sport, udp_header_t, src_port);
+	  udp->checksum = ip_csum_fold (csum);
+	}
+    }
+  else if (inner_proto == IP_PROTOCOL_ICMP)
+    {
+      icmp46_header_t *icmp = (icmp46_header_t *) l4;
+      if (icmp->type == ICMP4_echo_request || icmp->type == ICMP4_echo_reply)
+	((u16 *) icmp)[2] = new_sport;
+    }
   return 0;
 }
 
@@ -256,6 +348,7 @@ sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
   sfw_nat64_v6_to_v4_ctx_t ctx;
   ctx.new_src = session->xlate.n64.v4_pool;
   ctx.new_dst = session->xlate.n64.v4_server;
+  ctx.session = session;
 
   if (next_header == IP_PROTOCOL_ICMP6)
     {
@@ -369,6 +462,7 @@ sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
   u8 protocol = ip4->protocol;
 
   sfw_nat64_v4_to_v6_ctx_t ctx;
+  ctx.session = session;
   /* v6 src = prefix::v4_server (extracted from session for stability) */
   {
     sfw_main_t *sm = &sfw_main;

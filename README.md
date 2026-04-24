@@ -327,11 +327,114 @@ bytes because `ip4-rewrite` has already prepended the L2 rewrite to
 
 ### IPv6 permit-stateful-nat
 
-IPv6 policies can use the `permit-stateful-nat` action (inherited from a
-shared zone-pair policy). Since IPv6 has no NAT, the action is treated
-identically to `permit-stateful` — a session is created with
-`nat_type = SFW_NAT_NONE`. This avoids requiring separate policies for
-IPv4 and IPv6 on the same zone pair.
+When a v6 flow's `permit-stateful-nat` policy applies and the
+destination falls within a configured NAT64 prefix (see below), the
+action triggers NAT64 translation. When no NAT64 prefix matches, the
+action is treated identically to `permit-stateful` — a session is
+created with `nat_type = SFW_NAT_NONE`. This lets a single zone-pair
+policy cover both IPv4 SNAT and IPv6-to-IPv4 NAT64 without needing
+separate per-family policies.
+
+### NAT64 (RFC 6146 stateful, RFC 7915 packet translation)
+
+sfw implements stateful NAT64 as a replacement for VPP's stock
+`plugins/nat/nat64/`, which hooks into VPP in ways that interfere with
+other plugins. sfw's NAT64 uses the same session table, zone-pair
+policy model, and per-thread v4 port allocation already in use for
+NAT44.
+
+**Configuration**
+
+A NAT64 pool advertises an IPv6 prefix (the RFC 6052 prefix IPv6
+clients use to address IPv4 destinations) and a pool of IPv4 source
+addresses for the translated packets:
+
+```
+sfw nat64 pool add 203.0.113.0/29 prefix 64:ff9b::/96
+```
+
+Supported prefix lengths are `{32, 40, 48, 56, 64, 96}` per RFC 6052.
+The well-known prefix `64:ff9b::/96` is the most common choice and
+works with DNS64 resolvers out of the box.
+
+A zone-pair policy with `permit-stateful-nat` as the action triggers
+NAT64 when the v6 destination matches a configured NAT64 prefix:
+
+```
+sfw zone internal-v6 interface tap0
+sfw zone external interface eth0
+sfw policy v6-outbound from-zone internal-v6 to-zone external
+sfw policy v6-outbound default-action permit-stateful-nat
+sfw nat64 pool add 203.0.113.0/29 prefix 64:ff9b::/96
+```
+
+**Packet flow**
+
+1. A v6 packet arrives at `sfw-ip6` (input arc) destined for a prefix
+   address like `64:ff9b::192.0.2.1`.
+2. Session lookup misses; policy returns `permit-stateful-nat`.
+3. `sfw_nat64_match_pool` finds the pool; `sfw_nat64_extract_v4`
+   recovers the embedded IPv4 destination.
+4. A v4 pool address + port are allocated from the per-thread bitmap.
+5. A session is created with `nat_type = SFW_NAT_NAT64`. Two bihash
+   entries are inserted: the v6 forward key and a v4 return key.
+6. `sfw_nat64_translate_v6_to_v4` rewrites the packet (v6 header → v4
+   header, 20-byte shrink) using core VPP's `ip6_to_ip4.h` helpers
+   for TCP/UDP/ICMP. The packet is handed off to `ip4-lookup`.
+7. The return v4 packet arrives at `sfw-ip4`, hits the session via
+   the v4 return key, is recognized as NAT64 by `nat_type`, and is
+   translated back to v6 (20-byte grow) via the mirror helpers.
+   Handed off to `ip6-lookup`.
+
+**ICMP translation**
+
+ICMP is translated per RFC 7915 using core VPP's `icmp6_to_icmp` and
+`icmp_to_icmp6` header-only helpers (which are not part of the stock
+NAT64 plugin and have no dependencies on it):
+
+- Echo request/reply (types 128/8 and 129/0): type translated, echo
+  identifier rewritten using session state, checksum recomputed.
+- Error messages (destination unreachable, time exceeded, packet too
+  big, parameter problem): outer ICMP type/code translated by the
+  helper; inner packet headers recursively rewritten. Inner
+  addresses are translated assuming the inner datagram travels in
+  the *reverse* direction of the outer error (the PMTUD case: the
+  error reporter received a packet and is complaining back), and
+  inner L4 ports/IDs are rewritten against session state.
+- ICMPv6 redirect (type 137) is intentionally not translated
+  (link-local scope per RFC 7915 §4.2).
+
+**Observability**
+
+```
+vppctl show sfw nat64 pools
+vppctl show sfw sessions verbose
+vppctl show errors | grep -i nat64
+```
+
+`show sfw sessions` prints NAT64 sessions with both the v6 tuple (in
+the session key) and the v4 side (`xlate.n64.v4_pool:port ->
+xlate.n64.v4_server`). Error counters cover successful translations
+(`NAT64_V6_TO_V4`, `NAT64_V4_TO_V6`), misconfigured dst prefix
+(`NAT64_UNKNOWN_PREFIX`), buffer headroom shortage on v4→v6 growth
+(`NAT64_HEADROOM`), and untranslatable ICMP (`NAT64_ICMP_UNSUPPORTED`).
+
+**Known limitations**
+
+- **Hairpinning** — a v6 client addressing `<prefix>::<v4-of-another-v6-client>`
+  is not currently translated twice (RFC-legal to punt).
+- **Fragment reassembly** — the core VPP translation helpers handle
+  single-fragment packets correctly; full pre-translation reassembly
+  is out of scope.
+- **ICMP errors from intermediate routers** — an ICMP error generated
+  by an intermediate v4 router (not the v4 server itself) may carry
+  an inner L4 header whose rewritten port disagrees with the
+  intermediate's actual view. Outer ICMP signaling (type/code/MTU)
+  still translates correctly, so PMTUD black-hole recovery works.
+- **Egress policy on v4 side** — NAT64 policy decisions are made
+  entirely on v6 ingress. The translated v4 packet still traverses
+  `sfw-ip4-out` if enabled, so per-interface egress filtering works,
+  but the v4 zone-pair policy is not re-evaluated.
 
 ## File Structure
 
@@ -342,6 +445,7 @@ IPv4 and IPv6 on the same zone pair.
 | `sfw_node.c` | Packet processing: sfw-ip4 / sfw-ip6 input nodes and sfw-ip4-out / sfw-ip6-out output nodes (two-pass design) |
 | `sfw_rules.c` | Rule matching: first-match evaluation with prefix/port/protocol/ICMP filtering |
 | `sfw_session.c` | Session lifecycle: create, remove (with dual hash cleanup), format for display |
-| `sfw_nat.c` | NAT pool management (deterministic and dynamic modes), static 1:1 / DNAT mappings, per-thread port bitmaps, address/port translation, incremental checksum updates |
-| `sfw.api` | Binary API definitions (currently `sfw_enable_disable`) |
+| `sfw_nat.c` | NAT44 pool management (deterministic and dynamic modes), static 1:1 / DNAT mappings, per-thread port bitmaps, address/port translation, incremental checksum updates |
+| `sfw_nat64.c` | NAT64 (RFC 6146): RFC 6052 prefix embed/extract, v6↔v4 packet translation (TCP/UDP inline, ICMP via core VPP `ip6_to_ip4.h` / `ip4_to_ip6.h` helpers), pool matching |
+| `sfw.api` | Binary API definitions (policy/rule, NAT pool, NAT static, NAT64 pool, zone and interface ops) |
 | `sfw_test.c` | VAT test client for the binary API |

@@ -256,6 +256,18 @@ format_sfw_session (u8 *s, va_list *args)
 		  format_ip4_address, &sess->xlate.v4.orig_addr,
 		  clib_net_to_host_u16 (sess->xlate.v4.orig_port));
     }
+  else if (sess->nat_type == SFW_NAT_NAT64)
+    {
+      /* Show the v4 side of the mapping: our SNAT'd pool src -> v4 server
+       * at the v4 dport (stored on the reversed k6 as src_port). Makes
+       * the v6<->v4 correspondence obvious at a glance. */
+      s = format (s, " NAT64 v4 %U:%u->%U:%u (pool %u)", format_ip4_address,
+		  &sess->xlate.n64.v4_pool,
+		  clib_net_to_host_u16 (sess->xlate.n64.v4_pool_port),
+		  format_ip4_address, &sess->xlate.n64.v4_server,
+		  clib_net_to_host_u16 (sess->k6.src_port),
+		  sess->xlate.n64.pool_idx);
+    }
 
   if (verbose)
     {
