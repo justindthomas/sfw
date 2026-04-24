@@ -2,14 +2,24 @@
 #
 # Containerised build for the sfw VPP plugin.
 #
-# Builds a small Debian image with VPP 25.10 dev packages, then compiles
-# the plugin against this checkout and drops sfw_plugin.so into ./output/.
+# Two modes:
+#   Default (BUILD_DEBS=0): fast plugin-only build. Uses Dockerfile,
+#     installs stock fd.io vpp-dev 25.10-release, compiles just the
+#     sfw plugin, drops sfw_plugin.so into ./output/.
+#   BUILD_DEBS=1: full patched VPP + sfw build. Uses Dockerfile.debs
+#     (installs VPP's DEB_DEPENDS), clones VPP v25.10, applies
+#     vpp-patches/, drops sfw into src/plugins/sfw, runs `make
+#     pkg-deb`. Drops the resulting .deb set into ./output/. This is
+#     a developer shortcut for lab testing — the production deploy
+#     path is ~/code/emerald/imp's ISO build, whose 0200/0205 hooks
+#     perform the same steps inside the live-build chroot.
 #
 # Podman is preferred; falls back to docker if podman is not installed.
 # Override with CONTAINER_ENGINE=docker (or podman).
 #
 # Environment overrides:
 #   CONTAINER_ENGINE  podman | docker     (default: auto-detect)
+#   BUILD_DEBS        0 | 1               (default: 0, plugin-only)
 #   IMAGE_TAG         image tag to build  (default: sfw-build:25.10)
 #   VPP_BRANCH        VPP branch to clone (default: v25.10)
 #   BUILD_TYPE        CMake build type    (default: Release)
@@ -20,10 +30,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="$SCRIPT_DIR/output"
 
-IMAGE_TAG="${IMAGE_TAG:-sfw-build:25.10}"
+BUILD_DEBS="${BUILD_DEBS:-0}"
 VPP_BRANCH="${VPP_BRANCH:-v25.10}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-}"
+
+if [ "$BUILD_DEBS" = "1" ]; then
+    IMAGE_TAG="${IMAGE_TAG:-sfw-build-debs:25.10}"
+    DOCKERFILE="Dockerfile.debs"
+else
+    IMAGE_TAG="${IMAGE_TAG:-sfw-build:25.10}"
+    DOCKERFILE="Dockerfile"
+fi
 
 if [ -z "${CONTAINER_ENGINE:-}" ]; then
     if command -v podman >/dev/null 2>&1; then
@@ -40,7 +58,7 @@ echo "[+] Using container engine: $CONTAINER_ENGINE"
 mkdir -p "$OUTPUT_DIR"
 
 echo "[+] Building image $IMAGE_TAG..."
-"$CONTAINER_ENGINE" build -t "$IMAGE_TAG" -f "$SCRIPT_DIR/Dockerfile" "$SCRIPT_DIR"
+"$CONTAINER_ENGINE" build -t "$IMAGE_TAG" -f "$SCRIPT_DIR/$DOCKERFILE" "$SCRIPT_DIR"
 
 # Podman on Linux honours :Z for SELinux relabeling; harmless on docker/macOS
 # rootless setups when the volume flag is parsed (podman accepts, docker does
@@ -50,13 +68,14 @@ if [ "$CONTAINER_ENGINE" = "podman" ]; then
     VOL_OPTS=":Z"
 fi
 
-echo "[+] Running build inside container..."
+echo "[+] Running build inside container (BUILD_DEBS=$BUILD_DEBS)..."
 "$CONTAINER_ENGINE" run --rm \
     -v "$SCRIPT_DIR:/src${VOL_OPTS}" \
     -v "$OUTPUT_DIR:/out${VOL_OPTS}" \
     -e VPP_BRANCH="$VPP_BRANCH" \
     -e BUILD_TYPE="$BUILD_TYPE" \
     -e JOBS="$JOBS" \
+    -e BUILD_DEBS="$BUILD_DEBS" \
     "$IMAGE_TAG" bash -euo pipefail -c '
         JOBS="${JOBS:-$(nproc)}"
         echo "[+] Cloning VPP $VPP_BRANCH..."
@@ -65,8 +84,8 @@ echo "[+] Running build inside container..."
 
         # Apply VPP patches sfw needs as core-side hooks. These are
         # small, plan to be upstreamed, and fail-fast so a bad patch
-        # stops the build rather than silently producing a broken
-        # plugin. Patches are applied with -p1 from the VPP source root.
+        # stops the build rather than silently producing broken
+        # artifacts. Applied with -p1 from the VPP source root.
         if [ -d /src/vpp-patches ] && compgen -G "/src/vpp-patches/*.patch" > /dev/null; then
             echo "[+] Applying VPP patches..."
             for p in /src/vpp-patches/*.patch; do
@@ -81,25 +100,44 @@ echo "[+] Running build inside container..."
             [ -e "$f" ] && cp "$f" /tmp/vpp-src/src/plugins/sfw/
         done
 
-        echo "[+] Configuring ($BUILD_TYPE)..."
-        mkdir -p /tmp/vpp-src/build && cd /tmp/vpp-src/build
-        cmake ../src \
-            -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-            -DVPP_BUILD_TESTS=OFF \
-            -DCMAKE_C_FLAGS="-Werror" \
-            2>&1 | tail -5
+        if [ "$BUILD_DEBS" = "1" ]; then
+            echo "[+] Building full VPP .deb set (this takes a while)..."
+            cd /tmp/vpp-src
+            # VPP stashes built .debs in build-root/. make pkg-deb
+            # drives debhelper end-to-end so no separate cmake step
+            # is needed — the sfw plugin gets picked up automatically
+            # because it lives under src/plugins/sfw.
+            make pkg-deb 2>&1 | tail -20
 
-        echo "[+] Building sfw_plugin (-j$JOBS)..."
-        make -j"$JOBS" sfw_plugin 2>&1 | tail -10
+            echo "[+] Copying .debs to /out/..."
+            mkdir -p /out/debs
+            cp build-root/*.deb /out/debs/
+            ls -la /out/debs/
+        else
+            echo "[+] Configuring ($BUILD_TYPE)..."
+            mkdir -p /tmp/vpp-src/build && cd /tmp/vpp-src/build
+            cmake ../src \
+                -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
+                -DVPP_BUILD_TESTS=OFF \
+                -DCMAKE_C_FLAGS="-Werror" \
+                2>&1 | tail -5
 
-        PLUGIN=$(find . -name sfw_plugin.so -type f | head -1)
-        if [ -z "$PLUGIN" ]; then
-            echo "[-] Build failed: sfw_plugin.so not found" >&2
-            exit 1
+            echo "[+] Building sfw_plugin (-j$JOBS)..."
+            make -j"$JOBS" sfw_plugin 2>&1 | tail -10
+
+            PLUGIN=$(find . -name sfw_plugin.so -type f | head -1)
+            if [ -z "$PLUGIN" ]; then
+                echo "[-] Build failed: sfw_plugin.so not found" >&2
+                exit 1
+            fi
+            cp "$PLUGIN" /out/sfw_plugin.so
+            echo "[+] Build successful: /out/sfw_plugin.so"
+            ls -la /out/sfw_plugin.so
         fi
-        cp "$PLUGIN" /out/sfw_plugin.so
-        echo "[+] Build successful: /out/sfw_plugin.so"
-        ls -la /out/sfw_plugin.so
     '
 
-echo "[+] Done: $OUTPUT_DIR/sfw_plugin.so"
+if [ "$BUILD_DEBS" = "1" ]; then
+    echo "[+] Done: $OUTPUT_DIR/debs/*.deb"
+else
+    echo "[+] Done: $OUTPUT_DIR/sfw_plugin.so"
+fi
