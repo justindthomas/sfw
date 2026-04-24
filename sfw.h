@@ -47,8 +47,9 @@ STATIC_ASSERT_SIZEOF (sfw_key6_t, 48);
 typedef enum
 {
   SFW_NAT_NONE = 0,
-  SFW_NAT_SNAT, /* source translation (outbound) */
-  SFW_NAT_DNAT, /* destination translation (inbound port forward) */
+  SFW_NAT_SNAT,  /* source translation (outbound) */
+  SFW_NAT_DNAT,  /* destination translation (inbound port forward) */
+  SFW_NAT_NAT64, /* stateful IPv6->IPv4 translation (RFC 6146) */
 } sfw_nat_type_t;
 
 typedef enum
@@ -57,16 +58,42 @@ typedef enum
   SFW_NAT_MODE_DYNAMIC,
 } sfw_nat_mode_t;
 
-/* NAT pool: maps internal prefix to external prefix */
+/* Pool kind distinguishes NAT44 pools (internal v4 -> external v4)
+ * from NAT64 pools (NAT64 v6 prefix -> external v4). */
+typedef enum
+{
+  SFW_POOL_KIND_NAT44 = 0,
+  SFW_POOL_KIND_NAT64 = 1,
+} sfw_pool_kind_t;
+
+/* NAT pool: maps internal prefix to external prefix.
+ * For NAT44 (kind == NAT44) the internal_addr/plen describes the v4 source
+ * range to translate and external_addr/plen the v4 pool to translate into.
+ * For NAT64 (kind == NAT64) the external_addr/plen is still the v4 pool,
+ * but internal_addr/plen is unused; nat64_prefix / nat64_prefix_len
+ * describe the RFC 6052 prefix used to embed the v4 destination in v6.
+ *
+ * The per-thread port allocation machinery is shared verbatim: the
+ * bitmap indexes v4 pool addresses by external_idx and port slots by
+ * (port - thread_port_start[t]).  NAT64 ICMP echo identifiers consume
+ * entries from the same bitmap as TCP/UDP ports (both are u16). */
 typedef struct
 {
-  ip4_address_t external_addr; /* first address in external range */
-  u8 external_plen;
-  ip4_address_t internal_addr; /* first address in internal range */
-  u8 internal_plen;
-  u8 mode; /* sfw_nat_mode_t */
+  u8 kind; /* sfw_pool_kind_t: NAT44 or NAT64 */
 
-  /* Deterministic mode parameters */
+  ip4_address_t external_addr; /* first address in external v4 range */
+  u8 external_plen;
+  ip4_address_t internal_addr; /* first address in internal range (NAT44 only) */
+  u8 internal_plen;
+  u8 mode; /* sfw_nat_mode_t — NAT64 pools are always dynamic */
+
+  /* NAT64 only: RFC 6052 prefix for address embedding (valid when
+   * kind == SFW_POOL_KIND_NAT64). nat64_prefix_len must be one of
+   * {32, 40, 48, 56, 64, 96}. */
+  ip6_address_t nat64_prefix;
+  u8 nat64_prefix_len;
+
+  /* Deterministic mode parameters (NAT44 only) */
   u16 ports_per_host;
 
   /* Dynamic mode: per-thread port ranges.
@@ -104,7 +131,7 @@ typedef struct
 
 typedef struct
 {
-  u8 is_ip6;
+  u8 is_ip6; /* ingress family; set once at session create */
   union
   {
     sfw_key4_t k4;
@@ -115,14 +142,37 @@ typedef struct
   u32 lru_next;
   u32 lru_prev;
 
-  /* NAT translation info (nat_type == SFW_NAT_NONE if no translation) */
-  u8 nat_type;		    /* sfw_nat_type_t */
-  ip4_address_t nat_addr;  /* translated address */
-  u16 nat_port;		    /* translated port (network byte order) */
-  ip4_address_t orig_addr; /* original pre-translation address */
-  u16 orig_port;	    /* original pre-translation port (network byte order)
-			     */
+  u8 nat_type;	  /* sfw_nat_type_t */
   u8 has_nat_key; /* 1 if a second bihash entry exists for the NATted key */
+
+  /* Translation state — tag discriminated by nat_type.
+   *   SFW_NAT_NONE                      → neither branch used
+   *   SFW_NAT_SNAT / SFW_NAT_DNAT      → xlate.v4 holds v4 NAT info
+   *   SFW_NAT_NAT64                     → xlate.n64 holds cross-family info
+   *
+   * NAT44 call sites read xlate.v4.*; NAT64 paths use xlate.n64.*
+   * The v4 return key for a NAT64 session is reconstructable from
+   * (n64.v4_server, n64.v4_pool, k6.src_port, n64.v4_pool_port, proto)
+   * — k6 stores the ingress v6 key reversed for return-lookup matching,
+   * so k6.src_port already equals the v4 dport and k6.dst_port already
+   * equals the original v6 client sport. */
+  union
+  {
+    struct
+    {
+      ip4_address_t nat_addr;  /* translated address */
+      u16 nat_port;		/* translated port (network byte order) */
+      ip4_address_t orig_addr; /* original pre-translation address */
+      u16 orig_port;		/* original pre-translation port */
+    } v4;
+    struct
+    {
+      ip4_address_t v4_pool;	/* SNAT'd v4 source (from the pool) */
+      ip4_address_t v4_server; /* embedded v4 destination (extracted from v6) */
+      u16 v4_pool_port;	/* allocated v4 source port / ICMP id (net order) */
+      u8 pool_idx;		/* index into sm->nat_pools for port free */
+    } n64;
+  } xlate;
 
   /* TCP connection state for early session expiry.
    * RST from either direction → short timeout.
@@ -456,12 +506,45 @@ sfw_nat_static_t *sfw_nat_find_dnat (sfw_main_t *sm,
 u32 sfw_ip4_addr_index (ip4_address_t *addr, ip4_address_t *base, u8 plen);
 void sfw_ip4_addr_from_index (ip4_address_t *out, ip4_address_t *base,
 			      u8 plen, u32 index);
+u16 sfw_nat_pool_alloc_port (sfw_nat_pool_t *pool, u32 thread_index,
+			     u32 external_idx);
 void sfw_nat_free_port (sfw_nat_pool_t *pool, u32 thread_index,
 			u32 external_idx, u16 port_h);
 void sfw_nat_apply_snat (ip4_header_t *ip0, void *l4_hdr, u8 protocol,
 			 ip4_address_t *new_addr, u16 new_port);
 void sfw_nat_apply_dnat (ip4_header_t *ip0, void *l4_hdr, u8 protocol,
 			 ip4_address_t *new_addr, u16 new_port);
+
+/* NAT64 (RFC 6146 stateful, RFC 6052 prefix embed/extract, RFC 7915
+ * packet translation). All live in sfw_nat64.c. */
+
+/* RFC 6052 §2.2 embed: write <prefix> :: <v4> into out_v6 using the
+ * prefix length's u-octet rules. prefix_len must be one of
+ * {32,40,48,56,64,96}. */
+void sfw_nat64_embed_v4 (const ip6_address_t *prefix, u8 prefix_len,
+			 const ip4_address_t *v4, ip6_address_t *out_v6);
+
+/* RFC 6052 §2.2 extract: if v6 lies within <prefix>, write the
+ * embedded v4 into out_v4 and return 0; otherwise return -1. */
+int sfw_nat64_extract_v4 (const ip6_address_t *prefix, u8 prefix_len,
+			  const ip6_address_t *v6, ip4_address_t *out_v4);
+
+/* Find a NAT64 pool whose prefix covers v6_dst. Returns pool index into
+ * sm->nat_pools, or ~0 if no pool matches. */
+u32 sfw_nat64_match_pool (sfw_main_t *sm, const ip6_address_t *v6_dst);
+
+/* In-place translate the IPv6 packet at vlib_buffer_get_current(b) to
+ * IPv4, using session->xlate.n64 fields for the translated addresses
+ * and port/id. Shrinks the buffer by 20 bytes. Returns 0 on success,
+ * negative value on failure (unsupported protocol, headroom issue). */
+int sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
+				  sfw_session_t *session);
+
+/* In-place translate the IPv4 packet at vlib_buffer_get_current(b) to
+ * IPv6, using session fields for the restored v6 client addresses and
+ * ports. Grows the buffer by 20 bytes (requires buffer headroom). */
+int sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
+				  sfw_session_t *session);
 
 format_function_t format_sfw_session;
 

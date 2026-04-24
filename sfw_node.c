@@ -26,6 +26,7 @@ typedef struct
   u8 session_found;
   u8 protocol;
   u8 nat_applied;
+  u8 nat64_dir; /* 0=none, 1=v6->v4, 2=v4->v6 */
 } sfw_trace_t;
 
 #ifndef CLIB_MARCH_VARIANT
@@ -37,10 +38,11 @@ format_sfw_trace (u8 *s, va_list *args)
   CLIB_UNUSED (vlib_node_t * node) = va_arg (*args, vlib_node_t *);
   sfw_trace_t *t = va_arg (*args, sfw_trace_t *);
 
-  s = format (s,
-	      "SFW: sw_if %u next %u action %u sess %u proto %u nat %u\n",
-	      t->sw_if_index, t->next_index, t->action, t->session_found,
-	      t->protocol, t->nat_applied);
+  s = format (
+    s,
+    "SFW: sw_if %u next %u action %u sess %u proto %u nat %u nat64 %u\n",
+    t->sw_if_index, t->next_index, t->action, t->session_found, t->protocol,
+    t->nat_applied, t->nat64_dir);
   return s;
 }
 
@@ -59,7 +61,12 @@ vlib_node_registration_t sfw_ip6_output_node;
   _ (PERMITTED, "sfw packets permitted (stateless)")                          \
   _ (NAT_TRANSLATED, "sfw NAT translations")                                 \
   _ (NAT_EXHAUSTED, "sfw NAT port exhaustion drops")                          \
-  _ (LOCAL_ORIGINATED, "sfw locally-originated flows (ip*-output)")
+  _ (LOCAL_ORIGINATED, "sfw locally-originated flows (ip*-output)")           \
+  _ (NAT64_V6_TO_V4, "sfw NAT64 v6->v4 translations")                         \
+  _ (NAT64_V4_TO_V6, "sfw NAT64 v4->v6 translations")                         \
+  _ (NAT64_UNKNOWN_PREFIX, "sfw NAT64 dst not in any configured prefix")      \
+  _ (NAT64_HEADROOM, "sfw NAT64 buffer headroom exhausted (v4->v6)")          \
+  _ (NAT64_ICMP_UNSUPPORTED, "sfw NAT64 untranslatable ICMP drop")
 
 typedef enum
 {
@@ -80,6 +87,9 @@ static char *sfw_error_strings[] = {
 typedef enum
 {
   SFW_NEXT_DROP,
+  SFW_NEXT_LOOKUP_V4, /* for NAT64 v4->v6 return hand-off (sfw-ip4) and
+			v6->v4 ingress hand-off (sfw-ip6 after translate) */
+  SFW_NEXT_LOOKUP_V6, /* symmetric */
   SFW_N_NEXT,
 } sfw_next_t;
 
@@ -283,6 +293,8 @@ typedef struct
   u8 icmp_code;
   u8 nat_computed; /* 0=none, 1=SNAT, 2=DNAT */
   u8 nat_mode;	   /* sfw_nat_mode_t — set during pass 1 NAT translation */
+  u8 nat64_return; /* 1 if matched session has nat_type == SFW_NAT_NAT64
+		      and needs v4->v6 rewrite in pass 2 */
 } sfw_pkt_meta_t;
 
 always_inline uword
@@ -416,21 +428,30 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  m->action = SFW_ACTION_PERMIT;
 	  m->is_from_zone = is_from_zone;
 
-	  /* Apply NAT for existing sessions. nat_addr/nat_port hold the
-	   * translated address; orig_addr/orig_port hold the original.
+	  /* Apply NAT for existing sessions. xlate.v4 fields hold the
+	   * v4 NAT addresses/ports for SNAT/DNAT sessions.
 	   * from_zone traffic: rewrite source (SNAT direction).
-	   * to_zone traffic:   rewrite destination (reverse-DNAT). */
-	  if (m->session->nat_type != SFW_NAT_NONE)
+	   * to_zone traffic:   rewrite destination (reverse-DNAT).
+	   * NAT64 sessions are a special case: the matched session is
+	   * a v4 return direction hit; we defer the v4->v6 rewrite to
+	   * Pass 2 so both passes stay free of bihash / buffer-header
+	   * interleaving. */
+	  if (m->session->nat_type == SFW_NAT_SNAT ||
+	      m->session->nat_type == SFW_NAT_DNAT)
 	    {
 	      if (is_from_zone)
 		sfw_nat_apply_snat (ip0, l4_hdr, m->protocol,
-				    &m->session->nat_addr,
-				    m->session->nat_port);
+				    &m->session->xlate.v4.nat_addr,
+				    m->session->xlate.v4.nat_port);
 	      else
 		sfw_nat_apply_dnat (ip0, l4_hdr, m->protocol,
-				    &m->session->orig_addr,
-				    m->session->orig_port);
+				    &m->session->xlate.v4.orig_addr,
+				    m->session->xlate.v4.orig_port);
 	      nat_translated++;
+	    }
+	  else if (m->session->nat_type == SFW_NAT_NAT64)
+	    {
+	      m->nat64_return = 1;
 	    }
 
 	  /* TCP state tracking: shorten timeout on RST or bidirectional FIN.
@@ -554,10 +575,46 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   /* ================================================================
    * PASS 2: Create sessions + add to bihash. NO searches in this pass.
    * ================================================================ */
+  u32 nat64_v4_to_v6 = 0;
+  u32 nat64_icmp_unsupp = 0;
   for (i = 0; i < n_vectors; i++)
     {
       sfw_pkt_meta_t *m = &meta[i];
       ip4_header_t *ip0 = vlib_buffer_get_current (bufs[i]);
+
+      /* NAT64 v4->v6 return path: the v4 packet just matched a NAT64
+       * session and needs to be rewritten back to IPv6 before being
+       * handed off to ip6-lookup. No session state changes here. */
+      if (PREDICT_FALSE (m->nat64_return))
+	{
+	  int rv = sfw_nat64_translate_v4_to_v6 (vm, bufs[i], m->session);
+	  if (rv == 0)
+	    {
+	      nat64_v4_to_v6++;
+	      nexts[i] = SFW_NEXT_LOOKUP_V6;
+	    }
+	  else
+	    {
+	      nexts[i] = SFW_NEXT_DROP;
+	      bufs[i]->error = node->errors[SFW_ERROR_NAT64_ICMP_UNSUPPORTED];
+	      nat64_icmp_unsupp++;
+	    }
+
+	  if (is_trace && (bufs[i]->flags & VLIB_BUFFER_IS_TRACED))
+	    {
+	      sfw_trace_t *t =
+		vlib_add_trace (vm, node, bufs[i], sizeof (*t));
+	      t->sw_if_index = vnet_buffer (bufs[i])->sw_if_index[VLIB_RX];
+	      t->next_index = nexts[i];
+	      t->action = SFW_ACTION_PERMIT;
+	      t->session_found = 1;
+	      t->protocol = m->protocol;
+	      t->nat_applied = 0;
+	      t->nat64_dir = 2; /* v4 -> v6 */
+	    }
+	  (void) ip0;
+	  continue;
+	}
 
       if (m->action == SFW_ACTION_DENY)
 	{
@@ -629,7 +686,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		    pool_elt_at_index (sm->sessions[gt], gi);
 		  if (gs->nat_type == SFW_NAT_SNAT)
 		    sfw_nat_apply_snat (ip0, l4_hdr, m->protocol,
-					&gs->nat_addr, gs->nat_port);
+					&gs->xlate.v4.nat_addr, gs->xlate.v4.nat_port);
 		  if (gt == thread_index)
 		    sfw_lru_touch (sm, gs, now);
 		  else
@@ -726,10 +783,10 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  s->k4.src_port = m->dst_port;
 		  s->k4.dst_port = m->src_port;
 		  s->k4.protocol = m->protocol;
-		  s->nat_addr = m->nat_addr;
-		  s->nat_port = m->nat_port;
-		  s->orig_addr = ip0->src_address;
-		  s->orig_port = m->src_port;
+		  s->xlate.v4.nat_addr = m->nat_addr;
+		  s->xlate.v4.nat_port = m->nat_port;
+		  s->xlate.v4.orig_addr = ip0->src_address;
+		  s->xlate.v4.orig_port = m->src_port;
 
 		  u64 enc = sfw_session_encode (
 		    thread_index, s - sm->sessions[thread_index]);
@@ -770,10 +827,10 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  s->k4.src_port = m->src_port;
 		  s->k4.dst_port = m->nat_port;
 		  s->k4.protocol = m->protocol;
-		  s->nat_addr = ip0->dst_address;
-		  s->nat_port = m->dst_port;
-		  s->orig_addr = m->nat_addr;
-		  s->orig_port = m->nat_port;
+		  s->xlate.v4.nat_addr = ip0->dst_address;
+		  s->xlate.v4.nat_port = m->dst_port;
+		  s->xlate.v4.orig_addr = m->nat_addr;
+		  s->xlate.v4.orig_port = m->nat_port;
 
 		  u64 enc = sfw_session_encode (
 		    thread_index, s - sm->sessions[thread_index]);
@@ -813,6 +870,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  t->session_found = (m->session != 0);
 	  t->protocol = m->protocol;
 	  t->nat_applied = m->nat_computed;
+	  t->nat64_dir = 0;
 	}
     }
 
@@ -836,6 +894,13 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
   if (PREDICT_FALSE (nat_exhausted))
     vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_NAT_EXHAUSTED,
 				 nat_exhausted);
+  if (PREDICT_FALSE (nat64_v4_to_v6))
+    vlib_node_increment_counter (vm, node->node_index,
+				 SFW_ERROR_NAT64_V4_TO_V6, nat64_v4_to_v6);
+  if (PREDICT_FALSE (nat64_icmp_unsupp))
+    vlib_node_increment_counter (vm, node->node_index,
+				 SFW_ERROR_NAT64_ICMP_UNSUPPORTED,
+				 nat64_icmp_unsupp);
   return n_vectors;
 }
 
@@ -865,6 +930,15 @@ typedef struct
   u8 is_from_zone;	  /* 1 if RX is from_zone (outbound) */
   u8 icmp_type;
   u8 icmp_code;
+
+  /* NAT64 ingress (v6->v4). nat64_pool_idx == ~0 means no NAT64. */
+  u32 nat64_pool_idx;
+  ip4_address_t nat64_v4_server; /* embedded v4 dst extracted from v6 */
+  ip4_address_t nat64_v4_pool;   /* allocated v4 pool source */
+  u16 nat64_v4_pool_port;	 /* allocated v4 src port (net order) */
+  u8 nat64_forward;		 /* 1 = new v6->v4 flow, translate in pass 2 */
+  u8 nat64_return;		 /* 1 = matched NAT64 session, translate
+				      (rare on v6 input; kept for symmetry) */
 } sfw_pkt_meta6_t;
 
 always_inline uword
@@ -901,6 +975,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       sfw_pkt_meta6_t *m = &meta[i];
       clib_memset (m, 0, sizeof (*m));
       m->action = SFW_ACTION_PERMIT;
+      m->nat64_pool_idx = ~0;
 
       ip6_header_t *ip0 = vlib_buffer_get_current (bufs[i]);
       u32 sw_if_index0 = vnet_buffer (bufs[i])->sw_if_index[VLIB_RX];
@@ -983,6 +1058,12 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  hits++;
 	  m->action = SFW_ACTION_PERMIT;
 
+	  /* If this is a NAT64 session, any v6 packet that matched it
+	   * is a forward-direction retransmit and needs v6->v4 rewrite
+	   * in Pass 2. */
+	  if (m->session->nat_type == SFW_NAT_NAT64)
+	    m->nat64_forward = 1;
+
 	  /* TCP state tracking */
 	  if (m->protocol == IP_PROTOCOL_TCP)
 	    {
@@ -1051,11 +1132,86 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	policy->rules, vec_len (policy->rules), policy->default_action, 1,
 	&src46, &dst46, m->protocol, clib_net_to_host_u16 (m->src_port),
 	clib_net_to_host_u16 (m->dst_port), m->icmp_type, m->icmp_code);
+
+      /* NAT64 pool match for PERMIT_STATEFUL_NAT flows.
+       * Only TCP/UDP/ICMPv6 are translatable; silently drop other
+       * protocols (IPsec, SCTP, etc.) through the untranslatable
+       * counter below. */
+      if (m->action == SFW_ACTION_PERMIT_STATEFUL_NAT)
+	{
+	  if (m->protocol != IP_PROTOCOL_TCP &&
+	      m->protocol != IP_PROTOCOL_UDP &&
+	      m->protocol != IP_PROTOCOL_ICMP6)
+	    {
+	      m->action = SFW_ACTION_DENY;
+	      continue;
+	    }
+
+	  u32 pool_idx = sfw_nat64_match_pool (sm, &ip0->dst_address);
+	  if (pool_idx == ~0u)
+	    {
+	      /* Policy permits NAT but dst isn't in any configured
+	       * NAT64 prefix — misconfiguration. Drop loudly. */
+	      m->action = SFW_ACTION_DENY;
+	      vlib_node_increment_counter (vm, node->node_index,
+					   SFW_ERROR_NAT64_UNKNOWN_PREFIX, 1);
+	      continue;
+	    }
+
+	  sfw_nat_pool_t *pool = &sm->nat_pools[pool_idx];
+	  ip4_address_t v4_dst;
+	  if (sfw_nat64_extract_v4 (&pool->nat64_prefix,
+				    pool->nat64_prefix_len,
+				    &ip0->dst_address, &v4_dst) != 0)
+	    {
+	      m->action = SFW_ACTION_DENY;
+	      vlib_node_increment_counter (vm, node->node_index,
+					   SFW_ERROR_NAT64_UNKNOWN_PREFIX, 1);
+	      continue;
+	    }
+
+	  /* Pick a preferred pool v4 address by hashing the 5-tuple,
+	   * then try subsequent addresses on exhaustion. Mirrors
+	   * sfw_nat_dynamic_translate. */
+	  u32 hash = ip0->src_address.as_u32[0] ^ ip0->src_address.as_u32[3] ^
+		     ((u32) m->src_port << 16) ^ (u32) m->protocol;
+	  u32 n = pool->n_external_addrs ? pool->n_external_addrs : 1;
+	  u32 preferred = hash % n;
+	  u16 port_h = 0;
+	  u32 external_idx = 0;
+	  for (u32 attempt = 0; attempt < n; attempt++)
+	    {
+	      external_idx = (preferred + attempt) % n;
+	      port_h =
+		sfw_nat_pool_alloc_port (pool, thread_index, external_idx);
+	      if (port_h != 0)
+		break;
+	    }
+	  if (port_h == 0)
+	    {
+	      m->action = SFW_ACTION_DENY;
+	      vlib_node_increment_counter (vm, node->node_index,
+					   SFW_ERROR_NAT_EXHAUSTED, 1);
+	      continue;
+	    }
+
+	  ip4_address_t v4_pool_addr;
+	  sfw_ip4_addr_from_index (&v4_pool_addr, &pool->external_addr,
+				   pool->external_plen, external_idx);
+	  m->nat64_pool_idx = pool_idx;
+	  m->nat64_v4_server = v4_dst;
+	  m->nat64_v4_pool = v4_pool_addr;
+	  m->nat64_v4_pool_port = clib_host_to_net_u16 (port_h);
+	  m->nat64_forward = 1;
+	}
     }
 
   /* ================================================================
    * PASS 2: Create sessions + add to bihash. NO searches in this pass.
    * ================================================================ */
+  u32 nat64_v6_to_v4 = 0;
+  u32 nat64_headroom = 0;
+  u32 nat64_icmp_unsupp = 0;
   for (i = 0; i < n_vectors; i++)
     {
       sfw_pkt_meta6_t *m = &meta[i];
@@ -1066,6 +1222,122 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  nexts[i] = SFW_NEXT_DROP;
 	  bufs[i]->error = node->errors[SFW_ERROR_DENIED];
 	  denied++;
+	}
+      else if (m->nat64_forward && m->session &&
+	       m->session->nat_type == SFW_NAT_NAT64)
+	{
+	  /* Retransmit of an existing NAT64 flow — translate the packet
+	   * using the existing session; no new session insertion. */
+	  int rv = sfw_nat64_translate_v6_to_v4 (vm, bufs[i], m->session);
+	  if (rv == 0)
+	    {
+	      nat64_v6_to_v4++;
+	      nexts[i] = SFW_NEXT_LOOKUP_V4;
+	    }
+	  else
+	    {
+	      nexts[i] = SFW_NEXT_DROP;
+	      bufs[i]->error = node->errors[SFW_ERROR_NAT64_ICMP_UNSUPPORTED];
+	      nat64_icmp_unsupp++;
+	    }
+	}
+      else if (m->nat64_forward && !m->session &&
+	       m->nat64_pool_idx != ~0u)
+	{
+	  /* New NAT64 forward flow — create session, insert both
+	   * bihash entries, then translate + hand off to ip4-lookup. */
+	  sfw_session_t *s = sfw_session_create (sm, thread_index, now);
+	  if (PREDICT_TRUE (s != 0))
+	    {
+	      s->is_ip6 = 1;
+	      s->nat_type = SFW_NAT_NAT64;
+	      s->has_nat_key = 1;
+	      /* k6: v6 forward key stored reversed (matches return
+	       * direction v6 lookup, plus serves as ingress-direction
+	       * match via the reverse-key scan at Pass 1 start). */
+	      ip6_address_copy (&s->k6.src, &ip0->dst_address);
+	      ip6_address_copy (&s->k6.dst, &ip0->src_address);
+	      s->k6.src_port = m->dst_port;
+	      s->k6.dst_port = m->src_port;
+	      s->k6.protocol = m->protocol;
+	      /* xlate.n64: v4 side state */
+	      s->xlate.n64.v4_pool = m->nat64_v4_pool;
+	      s->xlate.n64.v4_server = m->nat64_v4_server;
+	      s->xlate.n64.v4_pool_port = m->nat64_v4_pool_port;
+	      s->xlate.n64.pool_idx = m->nat64_pool_idx;
+
+	      u64 enc = sfw_session_encode (
+		thread_index, s - sm->sessions[thread_index]);
+
+	      clib_bihash_kv_48_8_t kv1, kv2;
+	      /* kv1: v6 forward key — use the stored k6 verbatim. */
+	      clib_memset (&kv1, 0, sizeof (kv1));
+	      clib_memcpy_fast (&kv1.key, &s->k6, sizeof (sfw_key6_t));
+	      kv1.value = enc;
+
+	      /* kv2: v4 return key (zero-padded to 48). Return
+	       * direction: v4 server -> v4 pool, src_port = v4_dport
+	       * (= m->dst_port), dst_port = allocated v4 pool port,
+	       * protocol = translated (ICMPv6 -> ICMP). */
+	      clib_memset (&kv2, 0, sizeof (kv2));
+	      sfw_key4_t *nk = (sfw_key4_t *) &kv2.key;
+	      nk->src = m->nat64_v4_server;
+	      nk->dst = m->nat64_v4_pool;
+	      nk->src_port = m->dst_port;
+	      nk->dst_port = m->nat64_v4_pool_port;
+	      nk->protocol = (m->protocol == IP_PROTOCOL_ICMP6) ?
+			       IP_PROTOCOL_ICMP :
+			       m->protocol;
+	      kv2.value = enc;
+
+	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
+		{
+		  created++;
+		  int rv = sfw_nat64_translate_v6_to_v4 (vm, bufs[i], s);
+		  if (rv == 0)
+		    {
+		      nat64_v6_to_v4++;
+		      nexts[i] = SFW_NEXT_LOOKUP_V4;
+		    }
+		  else if (rv == -2)
+		    {
+		      nexts[i] = SFW_NEXT_DROP;
+		      bufs[i]->error =
+			node->errors[SFW_ERROR_NAT64_HEADROOM];
+		      nat64_headroom++;
+		    }
+		  else
+		    {
+		      nexts[i] = SFW_NEXT_DROP;
+		      bufs[i]->error =
+			node->errors[SFW_ERROR_NAT64_ICMP_UNSUPPORTED];
+		      nat64_icmp_unsupp++;
+		    }
+		}
+	      else
+		{
+		  /* Hash insert failed; free the allocated port. */
+		  sfw_nat_pool_t *p = &sm->nat_pools[m->nat64_pool_idx];
+		  u32 ext_idx = sfw_ip4_addr_index (&m->nat64_v4_pool,
+						     &p->external_addr,
+						     p->external_plen);
+		  sfw_nat_free_port (
+		    p, thread_index, ext_idx,
+		    clib_net_to_host_u16 (m->nat64_v4_pool_port));
+		  nexts[i] = SFW_NEXT_DROP;
+		}
+	    }
+	  else
+	    {
+	      /* Session allocation failed; free the port. */
+	      sfw_nat_pool_t *p = &sm->nat_pools[m->nat64_pool_idx];
+	      u32 ext_idx =
+		sfw_ip4_addr_index (&m->nat64_v4_pool, &p->external_addr,
+				    p->external_plen);
+	      sfw_nat_free_port (
+		p, thread_index, ext_idx,
+		clib_net_to_host_u16 (m->nat64_v4_pool_port));
+	    }
 	}
       else if (m->action == SFW_ACTION_PERMIT)
 	{
@@ -1120,6 +1392,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  t->session_found = (m->session != 0);
 	  t->protocol = m->protocol;
 	  t->nat_applied = 0;
+	  t->nat64_dir = m->nat64_forward ? 1 : 0;
 	}
     }
 
@@ -1136,6 +1409,16 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 			       denied);
   vlib_node_increment_counter (vm, node->node_index, SFW_ERROR_PERMITTED,
 			       permitted);
+  if (PREDICT_FALSE (nat64_v6_to_v4))
+    vlib_node_increment_counter (vm, node->node_index,
+				 SFW_ERROR_NAT64_V6_TO_V4, nat64_v6_to_v4);
+  if (PREDICT_FALSE (nat64_headroom))
+    vlib_node_increment_counter (vm, node->node_index,
+				 SFW_ERROR_NAT64_HEADROOM, nat64_headroom);
+  if (PREDICT_FALSE (nat64_icmp_unsupp))
+    vlib_node_increment_counter (vm, node->node_index,
+				 SFW_ERROR_NAT64_ICMP_UNSUPPORTED,
+				 nat64_icmp_unsupp);
   return n_vectors;
 }
 
@@ -1430,6 +1713,7 @@ sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  t->session_found = (m->session != 0);
 	  t->protocol = m->protocol;
 	  t->nat_applied = 0;
+	  t->nat64_dir = 0;
 	}
     }
 
@@ -1712,6 +1996,7 @@ sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  t->session_found = (m->session != 0);
 	  t->protocol = m->protocol;
 	  t->nat_applied = 0;
+	  t->nat64_dir = 0;
 	}
     }
 
@@ -1755,6 +2040,8 @@ VLIB_REGISTER_NODE (sfw_ip4_node) = {
   .n_next_nodes = SFW_N_NEXT,
   .next_nodes = {
     [SFW_NEXT_DROP] = "error-drop",
+    [SFW_NEXT_LOOKUP_V4] = "ip4-lookup",
+    [SFW_NEXT_LOOKUP_V6] = "ip6-lookup",
   },
 };
 
@@ -1768,6 +2055,8 @@ VLIB_REGISTER_NODE (sfw_ip6_node) = {
   .n_next_nodes = SFW_N_NEXT,
   .next_nodes = {
     [SFW_NEXT_DROP] = "error-drop",
+    [SFW_NEXT_LOOKUP_V4] = "ip4-lookup",
+    [SFW_NEXT_LOOKUP_V6] = "ip6-lookup",
   },
 };
 
@@ -1781,6 +2070,8 @@ VLIB_REGISTER_NODE (sfw_ip4_output_node) = {
   .n_next_nodes = SFW_N_NEXT,
   .next_nodes = {
     [SFW_NEXT_DROP] = "error-drop",
+    [SFW_NEXT_LOOKUP_V4] = "ip4-lookup",
+    [SFW_NEXT_LOOKUP_V6] = "ip6-lookup",
   },
 };
 
@@ -1794,6 +2085,8 @@ VLIB_REGISTER_NODE (sfw_ip6_output_node) = {
   .n_next_nodes = SFW_N_NEXT,
   .next_nodes = {
     [SFW_NEXT_DROP] = "error-drop",
+    [SFW_NEXT_LOOKUP_V4] = "ip4-lookup",
+    [SFW_NEXT_LOOKUP_V6] = "ip6-lookup",
   },
 };
 #endif /* CLIB_MARCH_VARIANT */

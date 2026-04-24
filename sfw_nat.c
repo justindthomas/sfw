@@ -79,10 +79,11 @@ sfw_nat_det_translate (sfw_nat_pool_t *pool, ip4_address_t *internal_addr,
 /* --- Dynamic NAT port mapping --- */
 
 /* Allocate a port from this thread's exclusive slice of the port range.
- * Returns the allocated port in host byte order, or 0 on exhaustion. */
-static u16
-sfw_nat_alloc_port (sfw_nat_pool_t *pool, u32 thread_index,
-		    u32 external_idx)
+ * Returns the allocated port in host byte order, or 0 on exhaustion.
+ * Exposed for NAT64 which needs to allocate v4 pool ports independently. */
+u16
+sfw_nat_pool_alloc_port (sfw_nat_pool_t *pool, u32 thread_index,
+			 u32 external_idx)
 {
   u16 count = pool->thread_port_count[thread_index];
   if (count == 0)
@@ -134,7 +135,8 @@ sfw_nat_dynamic_translate (sfw_nat_pool_t *pool, u32 thread_index,
   for (attempt = 0; attempt < n; attempt++)
     {
       u32 external_idx = (preferred_idx + attempt) % n;
-      u16 port = sfw_nat_alloc_port (pool, thread_index, external_idx);
+      u16 port =
+	sfw_nat_pool_alloc_port (pool, thread_index, external_idx);
       if (port != 0)
 	{
 	  sfw_ip4_addr_from_index (out_external, &pool->external_addr,
@@ -160,6 +162,12 @@ sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
   for (i = 0; i < vec_len (sm->nat_pools); i++)
     {
       sfw_nat_pool_t *pool = &sm->nat_pools[i];
+
+      /* NAT44 source translation only applies to NAT44 pools. NAT64
+       * pools advertise a v4 external range but are matched on the
+       * v6 destination side by sfw_nat64_match_pool. */
+      if (pool->kind != SFW_POOL_KIND_NAT44)
+	continue;
 
       /* Check if source address falls within this pool's internal range */
       u32 mask = pool->internal_plen ?

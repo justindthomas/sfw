@@ -113,9 +113,9 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
       clib_memset (&kv, 0, sizeof (kv));
       sfw_key4_t *nk = (sfw_key4_t *) &kv.key;
       nk->src = s->k4.src;
-      nk->dst = s->nat_addr;
+      nk->dst = s->xlate.v4.nat_addr;
       nk->src_port = s->k4.src_port;
-      nk->dst_port = s->nat_port;
+      nk->dst_port = s->xlate.v4.nat_port;
       nk->protocol = s->k4.protocol;
       rv = clib_bihash_add_del_48_8 (&sm->session_hash, &kv, 0 /* is_add */);
       if (PREDICT_FALSE (rv != 0))
@@ -125,42 +125,84 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
     {
       clib_memset (&kv, 0, sizeof (kv));
       sfw_key4_t *nk = (sfw_key4_t *) &kv.key;
-      nk->src = s->nat_addr;
+      nk->src = s->xlate.v4.nat_addr;
       nk->dst = s->k4.dst;
-      nk->src_port = s->nat_port;
+      nk->src_port = s->xlate.v4.nat_port;
       nk->dst_port = s->k4.dst_port;
       nk->protocol = s->k4.protocol;
       rv = clib_bihash_add_del_48_8 (&sm->session_hash, &kv, 0 /* is_add */);
       if (PREDICT_FALSE (rv != 0))
 	clib_warning ("sfw: DNAT hash delete failed (rv=%d)", rv);
     }
+  else if (s->has_nat_key && s->nat_type == SFW_NAT_NAT64)
+    {
+      /* v4 return key. Return direction: src = v4_server, dst = v4_pool,
+       * src_port = v4_dport (stored in k6.src_port after the ingress
+       * reversal), dst_port = allocated v4 pool port, protocol =
+       * translated from ICMPv6 to ICMP if applicable. */
+      clib_memset (&kv, 0, sizeof (kv));
+      sfw_key4_t *nk = (sfw_key4_t *) &kv.key;
+      nk->src = s->xlate.n64.v4_server;
+      nk->dst = s->xlate.n64.v4_pool;
+      nk->src_port = s->k6.src_port;
+      nk->dst_port = s->xlate.n64.v4_pool_port;
+      nk->protocol = (s->k6.protocol == IP_PROTOCOL_ICMP6) ?
+		       IP_PROTOCOL_ICMP :
+		       s->k6.protocol;
+      rv = clib_bihash_add_del_48_8 (&sm->session_hash, &kv, 0 /* is_add */);
+      if (PREDICT_FALSE (rv != 0))
+	clib_warning ("sfw: NAT64 v4-return hash delete failed (rv=%d)", rv);
+    }
 
   /* Free the allocated port back to the bitmap for dynamic SNAT sessions */
   if (s->nat_type == SFW_NAT_SNAT)
     {
-      u16 port_h = clib_net_to_host_u16 (s->nat_port);
+      u16 port_h = clib_net_to_host_u16 (s->xlate.v4.nat_port);
       u32 i;
       for (i = 0; i < vec_len (sm->nat_pools); i++)
 	{
 	  sfw_nat_pool_t *pool = &sm->nat_pools[i];
+	  if (pool->kind != SFW_POOL_KIND_NAT44)
+	    continue;
 	  if (pool->mode != SFW_NAT_MODE_DYNAMIC || !pool->port_bitmaps)
 	    continue;
 	  /* Check if the NAT address belongs to this pool */
 	  if (pool->n_external_addrs == 1 &&
-	      pool->external_addr.as_u32 == s->nat_addr.as_u32)
+	      pool->external_addr.as_u32 == s->xlate.v4.nat_addr.as_u32)
 	    {
 	      sfw_nat_free_port (pool, s->thread_index, 0, port_h);
 	      break;
 	    }
 	  else if (pool->n_external_addrs > 1)
 	    {
-	      u32 ext_idx = sfw_ip4_addr_index (&s->nat_addr,
+	      u32 ext_idx = sfw_ip4_addr_index (&s->xlate.v4.nat_addr,
 						 &pool->external_addr,
 						 pool->external_plen);
 	      if (ext_idx < pool->n_external_addrs)
 		{
 		  sfw_nat_free_port (pool, s->thread_index, ext_idx, port_h);
 		  break;
+		}
+	    }
+	}
+    }
+  /* Free the allocated v4 pool port for NAT64 sessions. pool_idx is
+   * stored directly on the session, so no scan needed. */
+  else if (s->nat_type == SFW_NAT_NAT64)
+    {
+      if (s->xlate.n64.pool_idx < vec_len (sm->nat_pools))
+	{
+	  sfw_nat_pool_t *pool = &sm->nat_pools[s->xlate.n64.pool_idx];
+	  if (pool->kind == SFW_POOL_KIND_NAT64 && pool->port_bitmaps)
+	    {
+	      u32 ext_idx = sfw_ip4_addr_index (&s->xlate.n64.v4_pool,
+						 &pool->external_addr,
+						 pool->external_plen);
+	      if (ext_idx < pool->n_external_addrs)
+		{
+		  u16 port_h =
+		    clib_net_to_host_u16 (s->xlate.n64.v4_pool_port);
+		  sfw_nat_free_port (pool, s->thread_index, ext_idx, port_h);
 		}
 	    }
 	}
@@ -204,15 +246,15 @@ format_sfw_session (u8 *s, va_list *args)
   /* NAT translation info */
   if (sess->nat_type == SFW_NAT_SNAT)
     {
-      s = format (s, " SNAT->%U:%u", format_ip4_address, &sess->nat_addr,
-		  clib_net_to_host_u16 (sess->nat_port));
+      s = format (s, " SNAT->%U:%u", format_ip4_address, &sess->xlate.v4.nat_addr,
+		  clib_net_to_host_u16 (sess->xlate.v4.nat_port));
     }
   else if (sess->nat_type == SFW_NAT_DNAT)
     {
       s = format (s, " DNAT %U:%u->%U:%u", format_ip4_address,
-		  &sess->nat_addr, clib_net_to_host_u16 (sess->nat_port),
-		  format_ip4_address, &sess->orig_addr,
-		  clib_net_to_host_u16 (sess->orig_port));
+		  &sess->xlate.v4.nat_addr, clib_net_to_host_u16 (sess->xlate.v4.nat_port),
+		  format_ip4_address, &sess->xlate.v4.orig_addr,
+		  clib_net_to_host_u16 (sess->xlate.v4.orig_port));
     }
 
   if (verbose)

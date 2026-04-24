@@ -883,6 +883,7 @@ sfw_nat_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   sfw_nat_pool_t pool;
   clib_memset (&pool, 0, sizeof (pool));
+  pool.kind = SFW_POOL_KIND_NAT44;
   pool.external_addr = external_addr;
   pool.external_plen = external_plen;
   pool.internal_addr = internal_addr;
@@ -949,6 +950,184 @@ VLIB_CLI_COMMAND (sfw_nat_pool_command, static) = {
   .short_help = "sfw nat pool <ext-prefix> internal <int-prefix> "
 		"mode deterministic|dynamic",
   .function = sfw_nat_pool_command_fn,
+};
+
+/* --- CLI: sfw nat64 pool (RFC 6146 stateful NAT64) ---
+ *
+ *   sfw nat64 pool add <v4-ext-prefix> prefix <v6-prefix>/<len>
+ *   sfw nat64 pool del <v4-ext-prefix> prefix <v6-prefix>/<len>
+ *
+ * <len> must be one of {32, 40, 48, 56, 64, 96} per RFC 6052. */
+
+static int
+sfw_nat64_plen_valid (u32 plen)
+{
+  return (plen == 32 || plen == 40 || plen == 48 || plen == 56 ||
+	  plen == 64 || plen == 96);
+}
+
+static clib_error_t *
+sfw_nat64_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			   vlib_cli_command_t *cmd)
+{
+  sfw_main_t *sm = &sfw_main;
+  ip4_address_t external_addr;
+  u32 external_plen = 0;
+  ip6_address_t nat64_prefix;
+  u32 nat64_plen = 0;
+  int is_add = 1;
+
+  if (unformat (input, "add"))
+    is_add = 1;
+  else if (unformat (input, "del"))
+    is_add = 0;
+
+  if (!unformat (input, "%U/%u", unformat_ip4_address, &external_addr,
+		 &external_plen))
+    return clib_error_return (0, "expected external v4 prefix");
+
+  if (!unformat (input, "prefix %U/%u", unformat_ip6_address, &nat64_prefix,
+		 &nat64_plen))
+    return clib_error_return (0, "expected 'prefix <v6-prefix>/<len>'");
+
+  if (external_plen > 32)
+    return clib_error_return (0, "external v4 prefix length %u > 32",
+			      external_plen);
+  if (!sfw_nat64_plen_valid (nat64_plen))
+    return clib_error_return (
+      0, "NAT64 prefix length must be one of {32,40,48,56,64,96}");
+
+  if (is_add)
+    {
+      sfw_nat_pool_t pool;
+      clib_memset (&pool, 0, sizeof (pool));
+      pool.kind = SFW_POOL_KIND_NAT64;
+      pool.external_addr = external_addr;
+      pool.external_plen = external_plen;
+      pool.mode = SFW_NAT_MODE_DYNAMIC; /* deterministic has no NAT64 use */
+      ip6_address_copy (&pool.nat64_prefix, &nat64_prefix);
+      pool.nat64_prefix_len = nat64_plen;
+      pool.port_range_start = 1024;
+      pool.port_range_end = 65535;
+      pool.n_external_addrs =
+	(external_plen < 32) ? (1u << (32 - external_plen)) : 1;
+      pool.n_internal_addrs = 0; /* unused for NAT64 */
+
+      sfw_feature_init (sm);
+      u32 nworkers = vlib_num_workers ();
+      u32 nthreads = nworkers + 1;
+      u32 port_range = pool.port_range_end - pool.port_range_start + 1;
+      u32 slice = port_range / nthreads;
+      if (slice == 0)
+	slice = 1;
+
+      vec_validate (pool.port_bitmaps, nworkers);
+      vec_validate (pool.next_port, nworkers);
+      vec_validate (pool.thread_port_start, nworkers);
+      vec_validate (pool.thread_port_count, nworkers);
+
+      for (u32 t = 0; t < nthreads; t++)
+	{
+	  pool.thread_port_start[t] = pool.port_range_start + (t * slice);
+	  pool.thread_port_count[t] =
+	    (t == nthreads - 1) ? (port_range - t * slice) : slice;
+	  vec_validate (pool.port_bitmaps[t], pool.n_external_addrs - 1);
+	  vec_validate_init_empty (pool.next_port[t],
+				   pool.n_external_addrs - 1, 0);
+	  for (u32 a = 0; a < pool.n_external_addrs; a++)
+	    pool.port_bitmaps[t][a] = 0;
+	}
+
+      vec_add1 (sm->nat_pools, pool);
+      vlib_cli_output (vm, "NAT64 pool added: %U/%u (v4 pool) <- %U/%u (v6)",
+		       format_ip4_address, &external_addr, external_plen,
+		       format_ip6_address, &nat64_prefix, nat64_plen);
+    }
+  else
+    {
+      u32 i;
+      int matched = 0;
+      for (i = 0; i < vec_len (sm->nat_pools); i++)
+	{
+	  sfw_nat_pool_t *p = &sm->nat_pools[i];
+	  if (p->kind != SFW_POOL_KIND_NAT64)
+	    continue;
+	  if (p->external_addr.as_u32 == external_addr.as_u32 &&
+	      p->external_plen == external_plen &&
+	      p->nat64_prefix_len == nat64_plen &&
+	      clib_memcmp (&p->nat64_prefix, &nat64_prefix,
+			   sizeof (ip6_address_t)) == 0)
+	    {
+	      for (u32 t = 0; t < vec_len (p->port_bitmaps); t++)
+		vec_free (p->port_bitmaps[t]);
+	      vec_free (p->port_bitmaps);
+	      for (u32 t = 0; t < vec_len (p->next_port); t++)
+		vec_free (p->next_port[t]);
+	      vec_free (p->next_port);
+	      vec_free (p->thread_port_start);
+	      vec_free (p->thread_port_count);
+	      vec_delete (sm->nat_pools, 1, i);
+	      matched = 1;
+	      break;
+	    }
+	}
+      if (!matched)
+	return clib_error_return (0, "no matching NAT64 pool");
+      vlib_cli_output (vm, "NAT64 pool removed");
+    }
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sfw_nat64_pool_command, static) = {
+  .path = "sfw nat64 pool",
+  .short_help =
+    "sfw nat64 pool add|del <v4-ext-prefix> prefix <v6-prefix>/<len>",
+  .function = sfw_nat64_pool_command_fn,
+};
+
+/* --- CLI: show sfw nat64 pools --- */
+
+static clib_error_t *
+sfw_show_nat64_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			   vlib_cli_command_t *cmd)
+{
+  sfw_main_t *sm = &sfw_main;
+  u32 i;
+  u32 n = 0;
+
+  for (i = 0; i < vec_len (sm->nat_pools); i++)
+    if (sm->nat_pools[i].kind == SFW_POOL_KIND_NAT64)
+      n++;
+
+  vlib_cli_output (vm, "NAT64 pools: %u", n);
+  for (i = 0; i < vec_len (sm->nat_pools); i++)
+    {
+      sfw_nat_pool_t *p = &sm->nat_pools[i];
+      if (p->kind != SFW_POOL_KIND_NAT64)
+	continue;
+      vlib_cli_output (vm, "  [%u] v4-pool %U/%u  v6-prefix %U/%u", i,
+		       format_ip4_address, &p->external_addr, p->external_plen,
+		       format_ip6_address, &p->nat64_prefix,
+		       p->nat64_prefix_len);
+      if (p->port_bitmaps)
+	{
+	  for (u32 t = 0; t < vec_len (p->thread_port_count); t++)
+	    vlib_cli_output (vm,
+			     "    thread %u: port_start=%u count=%u "
+			     "bitmaps=%s",
+			     t, p->thread_port_start[t],
+			     p->thread_port_count[t],
+			     p->port_bitmaps[t] ? "allocated" : "NULL");
+	}
+    }
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sfw_show_nat64_command, static) = {
+  .path = "show sfw nat64 pools",
+  .short_help = "show sfw nat64 pools",
+  .function = sfw_show_nat64_command_fn,
 };
 
 /* --- CLI: sfw nat static --- */
@@ -1025,10 +1204,16 @@ sfw_show_nat_command_fn (vlib_main_t *vm, unformat_input_t *input,
   char *mode_names[] = { "deterministic", "dynamic" };
   u32 i;
 
-  vlib_cli_output (vm, "NAT pools: %u", vec_len (sm->nat_pools));
+  u32 n_nat44 = 0;
+  for (i = 0; i < vec_len (sm->nat_pools); i++)
+    if (sm->nat_pools[i].kind == SFW_POOL_KIND_NAT44)
+      n_nat44++;
+  vlib_cli_output (vm, "NAT pools: %u", n_nat44);
   for (i = 0; i < vec_len (sm->nat_pools); i++)
     {
       sfw_nat_pool_t *p = &sm->nat_pools[i];
+      if (p->kind != SFW_POOL_KIND_NAT44)
+	continue;
       if (p->mode == SFW_NAT_MODE_DETERMINISTIC)
 	vlib_cli_output (
 	  vm, "  [%u] %U/%u -> %U/%u mode %s (ports-per-host %u)", i,
@@ -1105,6 +1290,8 @@ sfw_show_nat_reverse_command_fn (vlib_main_t *vm, unformat_input_t *input,
     {
       sfw_nat_pool_t *pool = &sm->nat_pools[i];
 
+      if (pool->kind != SFW_POOL_KIND_NAT44)
+	continue;
       if (pool->mode != SFW_NAT_MODE_DETERMINISTIC)
 	continue;
 
@@ -1167,6 +1354,8 @@ sfw_show_nat_reverse_command_fn (vlib_main_t *vm, unformat_input_t *input,
   for (i = 0; i < vec_len (sm->nat_pools); i++)
     {
       sfw_nat_pool_t *pool = &sm->nat_pools[i];
+      if (pool->kind != SFW_POOL_KIND_NAT44)
+	continue;
       if (pool->mode == SFW_NAT_MODE_DETERMINISTIC)
 	continue;
       u32 dmask = pool->external_plen ?

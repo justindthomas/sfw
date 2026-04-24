@@ -111,6 +111,24 @@ autoreply define sfw_nat_pool_add_del
   u8 mode;
 };
 
+/** Create or delete a stateful NAT64 pool (RFC 6146).
+ *
+ * external_prefix is an IPv4 prefix describing the pool of v4 source
+ * addresses used on the v4 side of the translator. nat64_prefix is the
+ * RFC 6052 prefix the translator synthesizes into v6 destinations;
+ * nat64_prefix_len must be one of {32,40,48,56,64,96}.
+ *
+ * On delete the pool whose (external_prefix, nat64_prefix, length)
+ * tuple matches exactly is removed. */
+autoreply define sfw_nat64_pool_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_prefix_t external_prefix; /* IPv4 */
+  vl_api_prefix_t nat64_prefix;    /* IPv6 */
+};
+
 /** Create or delete a static (DNAT) mapping.
  *
  * protocol = 0 means 1:1 IP-level mapping (no port translation);

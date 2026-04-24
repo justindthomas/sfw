@@ -331,6 +331,7 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
     {
       sfw_nat_pool_t pool;
       clib_memset (&pool, 0, sizeof (pool));
+      pool.kind = SFW_POOL_KIND_NAT44;
       pool.external_addr = ext_addr;
       pool.external_plen = ext_plen;
       pool.internal_addr = int_addr;
@@ -411,6 +412,115 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 
 done:
   REPLY_MACRO (VL_API_SFW_NAT_POOL_ADD_DEL_REPLY);
+}
+
+/* --- sfw_nat64_pool_add_del --- */
+
+static int
+sfw_nat64_api_plen_valid (u8 plen)
+{
+  return (plen == 32 || plen == 40 || plen == 48 || plen == 56 ||
+	  plen == 64 || plen == 96);
+}
+
+static void
+vl_api_sfw_nat64_pool_add_del_t_handler (
+  vl_api_sfw_nat64_pool_add_del_t *mp)
+{
+  sfw_main_t *sm = &sfw_main;
+  vl_api_sfw_nat64_pool_add_del_reply_t *rmp;
+  int rv = 0;
+
+  fib_prefix_t ext_fp, v6_fp;
+  ip_prefix_decode (&mp->external_prefix, &ext_fp);
+  ip_prefix_decode (&mp->nat64_prefix, &v6_fp);
+
+  if (ext_fp.fp_proto != FIB_PROTOCOL_IP4 ||
+      v6_fp.fp_proto != FIB_PROTOCOL_IP6)
+    {
+      rv = VNET_API_ERROR_INVALID_ADDRESS_FAMILY;
+      goto done;
+    }
+  if (ext_fp.fp_len > 32 ||
+      !sfw_nat64_api_plen_valid ((u8) v6_fp.fp_len))
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
+
+  ip4_address_t ext_addr = ext_fp.fp_addr.ip4;
+  u8 ext_plen = ext_fp.fp_len;
+  ip6_address_t v6_prefix = v6_fp.fp_addr.ip6;
+  u8 v6_plen = v6_fp.fp_len;
+
+  if (mp->is_add)
+    {
+      sfw_nat_pool_t pool;
+      clib_memset (&pool, 0, sizeof (pool));
+      pool.kind = SFW_POOL_KIND_NAT64;
+      pool.external_addr = ext_addr;
+      pool.external_plen = ext_plen;
+      pool.mode = SFW_NAT_MODE_DYNAMIC;
+      ip6_address_copy (&pool.nat64_prefix, &v6_prefix);
+      pool.nat64_prefix_len = v6_plen;
+      pool.port_range_start = 1024;
+      pool.port_range_end = 65535;
+      pool.n_external_addrs =
+	(ext_plen < 32) ? (1u << (32 - ext_plen)) : 1;
+
+      sfw_feature_init (sm);
+      u32 nworkers = vlib_num_workers ();
+      u32 nthreads = nworkers + 1;
+      u32 port_range = pool.port_range_end - pool.port_range_start + 1;
+      u32 slice = port_range / nthreads;
+      if (slice == 0)
+	slice = 1;
+
+      vec_validate (pool.port_bitmaps, nworkers);
+      vec_validate (pool.next_port, nworkers);
+      vec_validate (pool.thread_port_start, nworkers);
+      vec_validate (pool.thread_port_count, nworkers);
+
+      for (u32 t = 0; t < nthreads; t++)
+	{
+	  pool.thread_port_start[t] = pool.port_range_start + (t * slice);
+	  pool.thread_port_count[t] =
+	    (t == nthreads - 1) ? (port_range - t * slice) : slice;
+	  vec_validate (pool.port_bitmaps[t], pool.n_external_addrs - 1);
+	  vec_validate_init_empty (pool.next_port[t],
+				   pool.n_external_addrs - 1, 0);
+	  for (u32 a = 0; a < pool.n_external_addrs; a++)
+	    pool.port_bitmaps[t][a] = 0;
+	}
+
+      vec_add1 (sm->nat_pools, pool);
+    }
+  else
+    {
+      u32 i;
+      int matched = 0;
+      for (i = 0; i < vec_len (sm->nat_pools); i++)
+	{
+	  sfw_nat_pool_t *p = &sm->nat_pools[i];
+	  if (p->kind != SFW_POOL_KIND_NAT64)
+	    continue;
+	  if (p->external_addr.as_u32 == ext_addr.as_u32 &&
+	      p->external_plen == ext_plen && p->nat64_prefix_len == v6_plen &&
+	      clib_memcmp (&p->nat64_prefix, &v6_prefix,
+			   sizeof (ip6_address_t)) == 0)
+	    {
+	      sfw_nat_pool_free_internals (p);
+	      vec_delete (sm->nat_pools, 1, i);
+	      matched = 1;
+	      break;
+	    }
+	}
+      if (!matched)
+	rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+done:
+  REPLY_MACRO (VL_API_SFW_NAT64_POOL_ADD_DEL_REPLY);
 }
 
 /* --- sfw_nat_static_add_del --- */
