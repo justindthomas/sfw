@@ -98,8 +98,21 @@ echo "[+] Running build inside container..."
             exit 1
         fi
         cp "$PLUGIN" /out/sfw_plugin.so
+
+        # Also export the generated sfw.api.json so it can be copied
+        # into the vpp-api crate (~/code/vpp-api/api-json/plugins/)
+        # to stay in lockstep with the compiled plugin. Required for
+        # the Rust binding codegen to pick up new messages + CRCs.
+        APIJSON=$(find . -path "*/plugins/sfw/sfw.api.json" -type f | head -1)
+        if [ -n "$APIJSON" ]; then
+            cp "$APIJSON" /out/sfw.api.json
+            echo "[+] API JSON exported: /out/sfw.api.json"
+        else
+            echo "[!] sfw.api.json not found — skipping export" >&2
+        fi
+
         echo "[+] Build successful: /out/sfw_plugin.so"
-        ls -la /out/sfw_plugin.so
+        ls -la /out/sfw_plugin.so /out/sfw.api.json 2>/dev/null
     '
 
 echo "[+] Done: $OUTPUT_DIR/sfw_plugin.so"

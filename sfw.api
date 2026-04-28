@@ -148,6 +148,30 @@ autoreply define sfw_pref64_advertise_add_del
   u16 lifetime_sec;
 };
 
+/** Enable or disable RFC 8106 RDNSS RA option on an interface.
+ *
+ * On is_add=true the RA emitted on sw_if_index will carry an RDNSS
+ * option listing the supplied IPv6 servers (1..4). lifetime_sec ==
+ * 0 selects sfw's default (90s = 3 × a 30s RA interval); 0xFFFFFFFF
+ * means infinite per RFC 8106 §5.1. servers MUST all be IPv6 and
+ * only the first n_servers entries are read.
+ *
+ * VPP itself has no native RDNSS support — the option type is
+ * declared in icmp46_packet.h but no builder/API exists. sfw owns
+ * the entire path via the ip6_ra extra-option hook.
+ *
+ * On is_add=false only sw_if_index is consulted. */
+autoreply define sfw_rdnss_advertise_add_del
+{
+  u32 client_index;
+  u32 context;
+  bool is_add;
+  vl_api_interface_index_t sw_if_index;
+  u32 lifetime_sec;
+  u8 n_servers;
+  vl_api_ip6_address_t servers[4];
+};
+
 /** Create or delete a static (DNAT) mapping.
  *
  * protocol = 0 means 1:1 IP-level mapping (no port translation);

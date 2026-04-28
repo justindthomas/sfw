@@ -1240,6 +1240,120 @@ VLIB_CLI_COMMAND (sfw_show_pref64_command, static) = {
   .function = sfw_show_pref64_command_fn,
 };
 
+/* --- CLI: sfw rdnss (RFC 8106 RA option) ---
+ *
+ *   sfw rdnss advertise <interface> servers <v6>[,<v6>]... [lifetime <s>]
+ *   sfw rdnss disable   <interface>
+ *   show sfw rdnss
+ *
+ * Up to SFW_RDNSS_MAX (4) servers; each must be IPv6. lifetime
+ * defaults to 90s (3 × a 30s RA cadence) per RFC 8106 §5.1
+ * recommendation. */
+
+static clib_error_t *
+sfw_rdnss_command_fn (vlib_main_t *vm, unformat_input_t *input,
+		      vlib_cli_command_t *cmd)
+{
+  sfw_main_t *sm = &sfw_main;
+  vnet_main_t *vnm = sm->vnet_main;
+  u32 sw_if_index = ~0;
+  int is_add = 1;
+  ip6_address_t servers[SFW_RDNSS_MAX];
+  u32 n_servers = 0;
+  u32 lifetime = 0;
+
+  clib_memset (servers, 0, sizeof (servers));
+
+  if (unformat (input, "advertise"))
+    is_add = 1;
+  else if (unformat (input, "disable"))
+    is_add = 0;
+  else
+    return clib_error_return (0, "expected 'advertise' or 'disable'");
+
+  if (!unformat (input, "%U", unformat_vnet_sw_interface, vnm, &sw_if_index))
+    return clib_error_return (0, "expected <interface>");
+
+  if (is_add)
+    {
+      if (!unformat (input, "servers"))
+	return clib_error_return (0, "expected 'servers <v6>[,<v6>]...'");
+
+      /* Comma-separated list, up to SFW_RDNSS_MAX. */
+      ip6_address_t one;
+      while (n_servers < SFW_RDNSS_MAX &&
+	     unformat (input, "%U", unformat_ip6_address, &one))
+	{
+	  clib_memcpy_fast (&servers[n_servers], &one, sizeof (one));
+	  n_servers++;
+	  if (!unformat (input, ","))
+	    break;
+	}
+      if (n_servers == 0)
+	return clib_error_return (0, "no valid IPv6 servers parsed");
+
+      (void) unformat (input, "lifetime %u", &lifetime);
+
+      if (sfw_rdnss_enable (sm, sw_if_index, servers, (u8) n_servers,
+			    lifetime) != 0)
+	return clib_error_return (0, "sfw_rdnss_enable failed");
+      vlib_cli_output (vm, "RDNSS advertising %u server(s) on %U",
+		       n_servers, format_vnet_sw_if_index_name, vnm,
+		       sw_if_index);
+    }
+  else
+    {
+      sfw_rdnss_disable (sm, sw_if_index);
+      vlib_cli_output (vm, "RDNSS disabled on %U",
+		       format_vnet_sw_if_index_name, vnm, sw_if_index);
+    }
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sfw_rdnss_command, static) = {
+  .path = "sfw rdnss",
+  .short_help = "sfw rdnss advertise <intf> servers <v6>[,<v6>]... "
+		"[lifetime <s>] | sfw rdnss disable <intf>",
+  .function = sfw_rdnss_command_fn,
+};
+
+static clib_error_t *
+sfw_show_rdnss_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			   vlib_cli_command_t *cmd)
+{
+  sfw_main_t *sm = &sfw_main;
+  vnet_main_t *vnm = sm->vnet_main;
+  u32 n = 0;
+
+  for (u32 i = 0; i < vec_len (sm->if_config); i++)
+    {
+      sfw_if_config_t *ic = &sm->if_config[i];
+      if (ic->rdnss_count == 0)
+	continue;
+      n++;
+      u32 lifetime_sec =
+	clib_net_to_host_u32 (*(u32 *) &ic->rdnss_option_bytes[4]);
+      vlib_cli_output (vm, "  %U: %u server(s), lifetime %us",
+		       format_vnet_sw_if_index_name, vnm, i,
+		       (u32) ic->rdnss_count, lifetime_sec);
+      for (u8 j = 0; j < ic->rdnss_count; j++)
+	{
+	  ip6_address_t addr;
+	  clib_memcpy_fast (&addr, &ic->rdnss_option_bytes[8 + 16 * j], 16);
+	  vlib_cli_output (vm, "    %U", format_ip6_address, &addr);
+	}
+    }
+  if (n == 0)
+    vlib_cli_output (vm, "no interfaces advertising RDNSS");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sfw_show_rdnss_command, static) = {
+  .path = "show sfw rdnss",
+  .short_help = "show sfw rdnss",
+  .function = sfw_show_rdnss_command_fn,
+};
+
 /* --- CLI: sfw nat static --- */
 
 static clib_error_t *
@@ -1522,6 +1636,10 @@ sfw_init (vlib_main_t *vm)
    * even when NAT64 is unused. Relies on the core-side extra-option
    * hook shipped in vpp-patches/. */
   sfw_pref64_init ();
+
+  /* Same hook, separate callback — RDNSS (RFC 8106) RA option. No-op
+   * on interfaces that haven't opted in via 'sfw rdnss advertise'. */
+  sfw_rdnss_init ();
 
   return 0;
 }

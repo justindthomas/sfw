@@ -551,6 +551,46 @@ done:
   REPLY_MACRO (VL_API_SFW_PREF64_ADVERTISE_ADD_DEL_REPLY);
 }
 
+/* --- sfw_rdnss_advertise_add_del --- */
+
+static void
+vl_api_sfw_rdnss_advertise_add_del_t_handler (
+  vl_api_sfw_rdnss_advertise_add_del_t *mp)
+{
+  sfw_main_t *sm = &sfw_main;
+  vl_api_sfw_rdnss_advertise_add_del_reply_t *rmp;
+  int rv = 0;
+  u32 sw_if_index = ntohl (mp->sw_if_index);
+
+  if (mp->is_add)
+    {
+      if (mp->n_servers == 0 || mp->n_servers > SFW_RDNSS_MAX)
+	{
+	  rv = VNET_API_ERROR_INVALID_VALUE;
+	  goto done;
+	}
+      ip6_address_t servers[SFW_RDNSS_MAX];
+      clib_memset (servers, 0, sizeof (servers));
+      for (u8 i = 0; i < mp->n_servers; i++)
+	clib_memcpy_fast (servers[i].as_u8, mp->servers[i], 16);
+
+      if (sfw_rdnss_enable (sm, sw_if_index, servers, mp->n_servers,
+			    ntohl (mp->lifetime_sec)) != 0)
+	{
+	  rv = VNET_API_ERROR_INVALID_VALUE;
+	  goto done;
+	}
+    }
+  else
+    {
+      if (sfw_rdnss_disable (sm, sw_if_index) != 0)
+	rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+done:
+  REPLY_MACRO (VL_API_SFW_RDNSS_ADVERTISE_ADD_DEL_REPLY);
+}
+
 /* --- sfw_nat_static_add_del --- */
 
 static void

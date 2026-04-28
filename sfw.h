@@ -291,7 +291,19 @@ typedef struct
    * time so the hot path is a straight 16-byte buffer append. */
   u8 pref64_advertise;
   u8 pref64_option_bytes[16];
+
+  /* RFC 8106 RDNSS option advertisement. When rdnss_count > 0, sfw's
+   * callback appends an 8 + 16*N byte RDNSS option to every RA
+   * emitted on this interface. rdnss_option_bytes is the exact wire
+   * format precomputed at config time; rdnss_option_len caches
+   * 8 + 16*rdnss_count for the hot path. Capped at 4 servers — fits
+   * comfortably in a single RA alongside PIO/MTU/SLLA/PREF64. */
+  u8 rdnss_count;
+  u8 rdnss_option_len;
+  u8 rdnss_option_bytes[8 + 16 * 4];
 } sfw_if_config_t;
+
+#define SFW_RDNSS_MAX 4
 
 /* --- Plugin main --- */
 
@@ -616,6 +628,25 @@ int sfw_pref64_enable (sfw_main_t *sm, u32 sw_if_index,
 		       const ip6_address_t *prefix, u8 prefix_len,
 		       u16 lifetime_sec);
 int sfw_pref64_disable (sfw_main_t *sm, u32 sw_if_index);
+
+/* --- RDNSS Router Advertisement option (RFC 8106) ---
+ *
+ * Same shape as PREF64: registered at plugin init via VPP's
+ * ip6_ra_extra_option_register. Emits an RDNSS option carrying up
+ * to SFW_RDNSS_MAX (4) IPv6 nameserver addresses on every RA sent
+ * on interfaces where sfw_rdnss_enable has been called. */
+
+void sfw_rdnss_init (void);
+
+/* Enable RDNSS advertisement on an interface. servers must point to
+ * n_servers IPv6 addresses (1..SFW_RDNSS_MAX). lifetime_sec == 0
+ * selects sfw's default (90s, suitable for our 30s RA cadence);
+ * 0xFFFFFFFF means infinite per RFC 8106 §5.1. Returns 0 on
+ * success, -1 on bad n_servers. */
+int sfw_rdnss_enable (sfw_main_t *sm, u32 sw_if_index,
+		      const ip6_address_t *servers, u8 n_servers,
+		      u32 lifetime_sec);
+int sfw_rdnss_disable (sfw_main_t *sm, u32 sw_if_index);
 
 format_function_t format_sfw_session;
 
