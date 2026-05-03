@@ -135,7 +135,9 @@ autoreply define sfw_nat64_pool_add_del
  * pointing at nat64_prefix with lifetime_sec. nat64_prefix must match
  * an existing NAT64 pool (otherwise the router would advertise a
  * prefix it doesn't actually translate). lifetime_sec == 0 selects a
- * sane default (1800s, clamped to the RFC 8781 maximum of 65528s).
+ * sane default (600s — ≤ 3 × VPP's default MaxRtrAdvInterval=200s
+ * per RFC 8781 §4.1, and ≤ a typical 600s router lifetime; clamped
+ * to the RFC 8781 maximum of 65528s).
  *
  * On is_add=false only sw_if_index is consulted. */
 autoreply define sfw_pref64_advertise_add_del
@@ -152,9 +154,12 @@ autoreply define sfw_pref64_advertise_add_del
  *
  * On is_add=true the RA emitted on sw_if_index will carry an RDNSS
  * option listing the supplied IPv6 servers (1..4). lifetime_sec ==
- * 0 selects sfw's default (90s = 3 × a 30s RA interval); 0xFFFFFFFF
- * means infinite per RFC 8106 §5.1. servers MUST all be IPv6 and
- * only the first n_servers entries are read.
+ * 0 selects sfw's default (600s — within RFC 8106 §5.1's
+ * [MaxRtrAdvInterval, 2 × MaxRtrAdvInterval] band for typical
+ * 200–600s intervals, and well above the 180s floor that Android
+ * 15+ enforces via accept_ra_min_lft); 0xFFFFFFFF means infinite.
+ * servers MUST all be IPv6 and only the first n_servers entries
+ * are read.
  *
  * VPP itself has no native RDNSS support — the option type is
  * declared in icmp46_packet.h but no builder/API exists. sfw owns

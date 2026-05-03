@@ -90,11 +90,16 @@ sfw_rdnss_enable (sfw_main_t *sm, u32 sw_if_index,
   vec_validate (sm->if_config, sw_if_index);
   sfw_if_config_t *ic = &sm->if_config[sw_if_index];
 
-  /* Lifetime default: 3 × typical 30s RA interval = 90s. RFC 8106
-   * §5.1 recommends ≤ 2 × MaxRtrAdvInterval; 90s sits comfortably
-   * within that for our 30s-max RA cadence. Caller may pass
-   * 0xFFFFFFFF for "infinite" or any explicit value. */
-  u32 lt = lifetime_sec ? lifetime_sec : 90;
+  /* Lifetime default: 600s. RFC 8106 §5.1 recommends RDNSS Lifetime
+   * be in [MaxRtrAdvInterval, 2 × MaxRtrAdvInterval]; 600s is a safe
+   * pick for the typical 200–600s MaxRtrAdvInterval range and stays
+   * well above the 180s floor that Android 15+ enforces via
+   * net.ipv6.conf.<if>.accept_ra_min_lft (RA sections under that
+   * value are silently dropped by the kernel — RDNSS at 90s
+   * triggered the v6-only-mostly + Android failure tracked at
+   * issuetracker #396995424). Caller may pass 0xFFFFFFFF for
+   * "infinite" or any explicit value. */
+  u32 lt = lifetime_sec ? lifetime_sec : 600;
 
   sfw_rdnss_build_option (ic->rdnss_option_bytes, servers, n, lt);
   ic->rdnss_option_len = 8 + 16 * n;

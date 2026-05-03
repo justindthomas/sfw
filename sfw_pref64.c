@@ -144,10 +144,14 @@ sfw_pref64_enable (sfw_main_t *sm, u32 sw_if_index,
   vec_validate (sm->if_config, sw_if_index);
   sfw_if_config_t *ic = &sm->if_config[sw_if_index];
 
-  /* Lifetime default: 3 × typical max RA interval (~200s) per
-   * RFC 8781 §4.1 recommendation, clamped to max representable
-   * value. Users can override via CLI/API lifetime parameter. */
-  u16 eff_lifetime = lifetime_sec ? lifetime_sec : 1800;
+  /* Lifetime default: 600s. RFC 8781 §4.1 says PREF64 lifetime
+   * SHOULD NOT exceed 3 × MaxRtrAdvInterval; with VPP's 200s default
+   * MaxRtrAdvInterval that caps it at 600s. Operationally it's also
+   * expected to be ≤ router lifetime so PREF64 doesn't outlive the
+   * default route that makes it useful. Above the 180s Android
+   * accept_ra_min_lft floor with margin. Users can override via
+   * CLI/API lifetime parameter. */
+  u16 eff_lifetime = lifetime_sec ? lifetime_sec : 600;
   if (eff_lifetime > 65528)
     eff_lifetime = 65528;
 
