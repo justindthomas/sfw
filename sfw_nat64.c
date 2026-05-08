@@ -383,6 +383,21 @@ sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
 
   if (next_header == IP_PROTOCOL_ICMP6)
     {
+      /* F5/F6 length pre-check, symmetric to the v4→v6 path below.
+       * `icmp6_to_icmp` calls our inner cb on TCP/UDP/ICMP6 inner
+       * datagrams; the cb reads/writes the inner L4 checksum at byte
+       * offset 16-17 (TCP), 6-7 (UDP), or 4-5 (ICMP echo id). RFC 4443
+       * requires ICMPv6 errors to carry "as much of the invoking packet
+       * as fits in 1280 bytes", but an attacker can craft a smaller
+       * one. Reject buffers that don't span outer IPv6 + outer ICMP6 +
+       * inner IPv6 + 18 bytes of inner L4 (TCP-conservative); without
+       * this, the cb reads/writes past the buffer (CWE-125 + CWE-787
+       * memory-corruption primitive). */
+      const size_t inner_l4_min = 18;
+      if (b->current_length <
+	  sizeof (ip6_header_t) + sizeof (icmp46_header_t) +
+	    sizeof (ip6_header_t) + inner_l4_min)
+	return -1;
       /* Core VPP helper handles the entire rewrite including header
        * shrink (vlib_buffer_advance), pseudo-header fixup, inner-packet
        * recursion for error messages, echo type translation, and L4
@@ -520,9 +535,16 @@ sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
 	  t == ICMP4_time_exceeded ||
 	  t == ICMP4_parameter_problem)
 	{
-	  /* Inner IPv4 header sits 8 bytes past the outer ICMP header. */
+	  /* Inner IPv4 header sits 8 bytes past the outer ICMP header.
+	   * F5: also require 18 bytes of inner L4 — `icmp_to_icmp6` will
+	   * call our inner cb, which reads/writes the inner L4 checksum
+	   * at byte offset 16-17 (TCP) — without this, an RFC-792-minimum
+	   * 8-byte inner L4 echo drives a 2-byte OOB read+write past the
+	   * buffer (CWE-125 + CWE-787). 18 bytes is conservative for TCP;
+	   * UDP (8) and ICMP (6) fit too. */
+	  const size_t inner_l4_min = 18;
 	  if (b->current_length <
-	      sizeof (ip4_header_t) + 8 + sizeof (ip4_header_t))
+	      sizeof (ip4_header_t) + 8 + sizeof (ip4_header_t) + inner_l4_min)
 	    return -1;
 	  ip4_header_t *inner = (ip4_header_t *) ((u8 *) outer_icmp + 8);
 	  u8 ip = inner->protocol;
@@ -609,6 +631,19 @@ sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
        * says drop unless we can recompute; recompute over payload. */
       udp_header_t *udp = (udp_header_t *) l4_hdr;
       u16 l4_len = clib_net_to_host_u16 (ip6->payload_length);
+      /* F7: ip6->payload_length is derived from the attacker-supplied
+       * v4 ip4->length and is u16 (up to 65535). VPP buffers are
+       * typically 2KB, so a forged total_length walks
+       * ip_incremental_checksum tens of KB past the buffer, leaking
+       * adjacent packet-pool memory into the folded checksum that
+       * goes out on the wire (CWE-125 + CWE-200). Drop translation
+       * when the declared L4 length exceeds the buffer's L4 reality —
+       * RFC 7915 §4.5 explicitly permits dropping packets whose
+       * UDP checksum cannot be correctly recomputed. */
+      size_t l4_avail =
+	b->current_length - ((u8 *) udp - (u8 *) vlib_buffer_get_current (b));
+      if (l4_len > l4_avail)
+	return -1;
       ip_csum_t csum = ip_incremental_checksum (0, udp, l4_len);
       csum = ip_csum_with_carry (csum, clib_host_to_net_u16 (l4_len));
       csum =
