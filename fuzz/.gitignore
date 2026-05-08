@@ -1,0 +1,5 @@
+out/
+corpus/
+artifacts/
+*.o
+*.a
