@@ -428,13 +428,23 @@ sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
 	{
 	  /* Inner IPv6 header sits 8 bytes past the outer ICMP6 header.
 	   * F5/F6 already required current_length >= 106 = 40+8+40+18,
-	   * so the inner ip6 header is fully readable here. */
+	   * so the inner ip6 header is fully readable here.
+	   *
+	   * F9.1: the ICMPv6 *error* outer header is 8 bytes (4-byte
+	   * generic icmp46_header_t + 4 bytes error-specific data per
+	   * RFC 4443 §3) — NOT sizeof(icmp46_header_t)=4. The VPP
+	   * helper at vnet/ip/ip6_to_ip4.h:259-307 uses the literal +8;
+	   * mirror that here so we read inner_ip6->payload_length from
+	   * the right offset. The previous F9 fix was off by 4, which
+	   * read part of the inner ip_version_traffic_class_and_flow_label
+	   * (12 bits attacker-controlled flow label) as if it were
+	   * payload_length — small misread values let real inflated
+	   * lengths slip through. */
 	  ip6_header_t *inner_ip6 =
-	    (ip6_header_t *) ((u8 *) outer_icmp6 + sizeof (icmp46_header_t));
+	    (ip6_header_t *) ((u8 *) outer_icmp6 + 8);
 	  u16 inner_pl = clib_net_to_host_u16 (inner_ip6->payload_length);
 	  size_t inner_pl_offset =
-	    sizeof (ip6_header_t) + sizeof (icmp46_header_t) +
-	    sizeof (ip6_header_t);
+	    sizeof (ip6_header_t) + 8 + sizeof (ip6_header_t);
 	  if (inner_pl > b->current_length - inner_pl_offset)
 	    return -1;
 	}
@@ -617,12 +627,48 @@ sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
 	   * ICMP recompute, where inner_ip6->payload_length =
 	   * htons(ntohs(inner_ip4->length) - 20). The same lower-bound
 	   * guard from F10 (length < sizeof(ip4_header_t) → wrap to ~65500)
-	   * applies on the inner header too. */
+	   * applies on the inner header too.
+	   *
+	   * F9.1: the ICMPv4 error outer header is 8 bytes (RFC 792 §3),
+	   * not sizeof(icmp46_header_t)=4. The `inner` pointer above
+	   * already uses the correct +8; the offset math here also has
+	   * to use 8 so the upper bound matches the actual inner_ip4
+	   * position. */
 	  size_t inner_ip4_offset =
-	    sizeof (ip4_header_t) + sizeof (icmp46_header_t);
+	    sizeof (ip4_header_t) + 8;
 	  u16 inner_len = clib_net_to_host_u16 (inner->length);
 	  if (inner_len < sizeof (ip4_header_t) ||
 	      inner_len > b->current_length - inner_ip4_offset)
+	    return -1;
+	}
+
+      /* F11: ICMP4 parameter_problem code 0/2 — `icmp_to_icmp6` indexes
+       * a static 20-entry `icmp_to_icmp6_updater_pointer_table` at
+       * vnet/ip/ip4_to_ip6.h:211 with the attacker-supplied byte at
+       * offset 4 of the ICMP header (the v4 "pointer" field), with no
+       * bounds check. Pointer ≥ 20 reads OOB into adjacent .rodata,
+       * and the read byte is then written into the outgoing v6 packet
+       * (CWE-125 + CWE-129 + CWE-200). The table has only 20 entries
+       * so reject any pointer byte ≥ 20 before invoking the helper.
+       * Pointer values > 19 are legitimate in IPv4 (e.g., 28 for an
+       * options-field error), so this rejects some valid ICMPv4
+       * traffic — but the upstream helper's table doesn't extend
+       * past index 19, so those translations weren't well-formed
+       * anyway. Cleaner upstream fix would be in VPP itself. */
+      if (t == ICMP4_parameter_problem &&
+	  (outer_icmp->code == ICMP4_parameter_problem_pointer_indicates_error
+	   || outer_icmp->code == ICMP4_parameter_problem_bad_length))
+	{
+	  /* Need at least sizeof(ip4_header_t)+sizeof(icmp46_header_t)+1
+	   * bytes to safely read the pointer byte (helper's
+	   * `*((u8 *)(icmp+1))`). F5/F6 minimum (66 bytes) covers this
+	   * for error types, but parameter_problem can hit the helper
+	   * directly without an inner — bound-check explicitly. */
+	  if (b->current_length <
+	      sizeof (ip4_header_t) + sizeof (icmp46_header_t) + 1)
+	    return -1;
+	  u8 ptr_byte = *((u8 *) outer_icmp + sizeof (icmp46_header_t));
+	  if (ptr_byte >= 20)
 	    return -1;
 	}
 
