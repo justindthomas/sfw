@@ -34,3 +34,6 @@ compile_commands.json
 tags
 TAGS
 .DS_Store
+
+# Local Claude Code state (incl. audit-finding pointer with file:line cites)
+.claude/audit.md
