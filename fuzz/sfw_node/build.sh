@@ -15,11 +15,11 @@
 #   runtime data + functions sfw .c files reach for outside
 #   libvppinfra.
 #
-# v2.0 scope (this script): every TU compiles, every symbol resolves
-# at link time, and a stub harness exits cleanly.  v2.1 will bring up
-# vlib_main_t / vlib_buffer_main_t / vlib_frame_t fixtures so the
-# fuzzer actually drives sfw_ip{4,6}_inline against synthesised
-# packets.
+# v2.1 scope (this script): every TU compiles, every symbol resolves
+# at link time, and the harness body invokes sfw_ip{4,6}_node_fn on
+# the fuzzer-supplied bytes loaded into a single synthesised
+# vlib_buffer.  v2.2 will lift policy / NAT / FIB coverage by
+# hand-filling sm->if_config + one zone-pair (see README.md).
 #
 # Usage:  build.sh [output-dir]
 #         (default output-dir: /src/fuzz/sfw_node/out)
