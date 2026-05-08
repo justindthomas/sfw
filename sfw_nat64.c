@@ -398,6 +398,17 @@ sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
 	  sizeof (ip6_header_t) + sizeof (icmp46_header_t) +
 	    sizeof (ip6_header_t) + inner_l4_min)
 	return -1;
+      /* F8: `icmp6_to_icmp` recomputes the outer ICMP checksum by
+       * walking `ip6->payload_length` bytes (vnet/ip/ip6_to_ip4.h:521).
+       * payload_length is u16 attacker-controlled; an inflated value
+       * walks tens of KB past the buffer and folds adjacent
+       * packet-pool memory into the on-wire checksum (CWE-125 +
+       * CWE-200). Mirror F7's drop-on-mismatch shape per RFC 7915
+       * §4.5: drop when the declared payload length exceeds what
+       * actually follows the IPv6 header. */
+      u16 declared_pl = clib_net_to_host_u16 (ip6->payload_length);
+      if (declared_pl > b->current_length - sizeof (ip6_header_t))
+	return -1;
       /* Core VPP helper handles the entire rewrite including header
        * shrink (vlib_buffer_advance), pseudo-header fixup, inner-packet
        * recursion for error messages, echo type translation, and L4
@@ -523,6 +534,19 @@ sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
 
   if (protocol == IP_PROTOCOL_ICMP)
     {
+      /* F8: `icmp_to_icmp6` recomputes the outer ICMP checksum by
+       * walking `ip4->length` bytes — `ip_incremental_checksum (...,
+       * icmp, ip6->payload_length)` at vnet/ip/ip4_to_ip6.h:482, with
+       * payload_length derived from ip4->length. An inflated u16
+       * length walks tens of KB past the buffer into adjacent
+       * packet-pool memory and folds it into the on-wire checksum
+       * (CWE-125 + CWE-200). The F5/F6 pre-check below only fires for
+       * error types — echo requests bypass it and can hit the helper
+       * with a 28-byte buffer claiming a 65535-byte length. Validate
+       * up front, mirroring F7's drop-on-mismatch per RFC 7915 §4.5. */
+      if (ip_len > b->current_length)
+	return -1;
+
       /* VPP's icmp_to_icmp6 (vnet/ip/ip4_to_ip6.h) calls os_panic() if
        * the embedded inner header in an ICMP error reports a protocol
        * other than TCP/UDP/ICMP. An attacker on the v4 side can reach
