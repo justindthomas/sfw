@@ -52,6 +52,14 @@
 #include <vnet/ip/ip_packet.h>
 #include <vppinfra/time.h>
 #include <vppinfra/vec.h>
+#include <vppinfra/pool.h>
+#include <vppinfra/bihash_24_8.h>
+#include <vnet/dpo/load_balance.h>
+#include <vnet/dpo/dpo.h>
+#include <vnet/fib/ip4_fib.h>
+#include <vnet/fib/ip4_fib_16.h>
+#include <vnet/fib/ip6_fib.h>
+#include <vnet/ip/ip4_mtrie.h>
 #include <sfw/sfw.h>
 
 #include "harness_init.h"
@@ -363,6 +371,132 @@ fuzz_buffer_enqueue_to_next_fn (vlib_main_t *vm, vlib_node_runtime_t *node,
   (void) count;
 }
 
+/* ============================================================ */
+/*  v2.2: policy + FIB fixture                                  */
+/* ============================================================ */
+
+/* v2.1 leaves sm->if_config empty, so src_zone resolves to
+ * SFW_ZONE_NONE for sw_if_index=0 and the per-packet loop short-
+ * circuits PERMIT before reaching the FIB / policy / NAT branches.
+ * v2.2 closes that gap with three pieces:
+ *
+ *   1. sm->if_config[0].zone_id = 2 ("external"), zone 2 declared in
+ *      sm->zones[].  src_zone now resolves to 2.
+ *
+ *   2. Minimal FIB fixture so sfw_resolve_dst_zone4/_zone6 return
+ *      SFW_ZONE_LOCAL (zone 1) instead of OOB-reading or asserting:
+ *        - ip4_fib_16s pool[0] with mtrie root_ply.leaves[i] = (0<<1)|1
+ *          (terminal leaf, LB index 0) for every 16-bit slot.
+ *        - ip6_fib_fwding_table.ip6_hash with one default-route entry
+ *          (key=(0,0,fib_index<<32|0)) → LB index 0; prefix_lengths_in_
+ *          search_order = [0]; ip6_main.fib_masks[0] is zeroed so the
+ *          loop's mask-and yields the default route key.
+ *        - load_balance_pool[0] with lb_n_buckets=1, the inline bucket
+ *          set to dpoi_type=DPO_RECEIVE so resolve_dst_zone returns
+ *          SFW_ZONE_LOCAL.
+ *
+ *   3. One zone-pair (2→1) bound to a wildcard policy whose
+ *      default_action is SFW_ACTION_PERMIT_STATEFUL.  That makes the
+ *      action-dispatch + session-create + bihash-insert path
+ *      reachable on every packet whose IP/L4 parse succeeds.
+ */
+
+static sfw_policy_t fuzz_default_policy;
+
+static void
+harness_setup_policy_fib_fixture (void)
+{
+  /* --- if_config + zones --- */
+  vec_validate_init_empty (sfw_main.if_config, 0,
+			   (sfw_if_config_t){ 0 });
+  sfw_main.if_config[0].zone_id = 2;
+  sfw_main.if_config[0].feature_on = 1;
+
+  /* sfw_feature_init already populated zone 1 (LOCAL).  Add zone 2.
+   * sm->n_zones = 2 after init; we extend to 3 so reverse iteration
+   * in sfw_zone_lookup hits the new entry. */
+  strncpy (sfw_main.zones[2].name, "external",
+	   sizeof (sfw_main.zones[2].name) - 1);
+  sfw_main.zones[2].zone_id = 2;
+  if (sfw_main.n_zones < 3)
+    sfw_main.n_zones = 3;
+
+  /* --- policy: zone 2 → zone 1, default_action permit-stateful --- */
+  /* Wildcard rule covering both AFs and any L4 — match-rules always
+   * returns SFW_ACTION_PERMIT_STATEFUL via the default action even
+   * with rules vec empty, so we don't strictly need a rule; the
+   * empty vec exercises sfw_match_rules's default-action path. */
+  memset (&fuzz_default_policy, 0, sizeof (fuzz_default_policy));
+  fuzz_default_policy.rules = 0; /* empty vec */
+  fuzz_default_policy.default_action = SFW_ACTION_PERMIT_STATEFUL;
+  fuzz_default_policy.implicit_icmpv6 = 1;
+  fuzz_default_policy.from_zone_id = 2;
+  fuzz_default_policy.to_zone_id = 1;
+  fuzz_default_policy.table_id = 0;
+  strncpy (fuzz_default_policy.name, "fuzz",
+	   sizeof (fuzz_default_policy.name) - 1);
+
+  /* zone_pairs slab: vec [SFW_MAX_ZONES * SFW_MAX_ZONES] of pointers.
+   * idx = from_zone * MAX + to_zone.  We bind both 2→1 and 1→2 so
+   * either is_from_zone branch in sfw_node.c lights up. */
+  vec_validate (sfw_main.zone_pairs_by_table, 0);
+  sfw_zone_pair_slab_t *slab = &sfw_main.zone_pairs_by_table[0];
+  vec_validate (slab->zone_pairs, SFW_MAX_ZONES * SFW_MAX_ZONES - 1);
+  slab->zone_pairs[2 * SFW_MAX_ZONES + 1].policy = &fuzz_default_policy;
+  slab->zone_pairs[1 * SFW_MAX_ZONES + 2].policy = &fuzz_default_policy;
+  slab->n_policies = 1;
+  vec_add1 (sfw_main.policies, &fuzz_default_policy);
+
+  /* --- IPv4 FIB fixture --- */
+  /* pool_get_zero allocates one element from the pool, returning a
+   * pointer.  The element is at index 0 since the pool was empty.
+   * After this, ip4_fib_get(0) (which is pool_elt_at_index(ip4_fib_16s,
+   * 0)) resolves cleanly. */
+  ip4_fib_16_t *fib4;
+  pool_get_zero (ip4_fib_16s, fib4);
+  /* mtrie: every 16-bit prefix slot = (0 << 1) | 1 = 1 = "terminal
+   * leaf, LB index 0".  ip4_mtrie_16_lookup_step_one returns this
+   * directly; subsequent step()s see is_terminal=1 and return the
+   * leaf unchanged.  Final ip4_mtrie_leaf_get_adj_index = 0. */
+  for (u32 i = 0; i < (1u << 16); i++)
+    fib4->mtrie.root_ply.leaves[i] = 1;
+
+  /* load_balance_pool[0] with one DPO_RECEIVE bucket (inline). */
+  load_balance_t *lb;
+  pool_get_zero (load_balance_pool, lb);
+  lb->lb_n_buckets = 1;
+  lb->lb_n_buckets_minus_1 = 0;
+  lb->lb_buckets_inline[0].dpoi_type = DPO_RECEIVE;
+  lb->lb_buckets_inline[0].dpoi_index = 0;
+
+  /* --- IPv6 FIB fixture --- */
+  /* ip6_fib_table_fwding_lookup walks
+   * ip6_fib_fwding_table.prefix_lengths_in_search_order; an empty vec
+   * trips ASSERT(0) in the "default route always present" branch.
+   * Install one prefix length (0 = default) and add a 0::/0 entry
+   * mapping to LB index 0. */
+  vec_add1 (ip6_fib_fwding_table.prefix_lengths_in_search_order, 0);
+
+  /* ip6_main.fib_masks[0] = all-zero is what we want for prefix
+   * length 0 — the lookup masks the dst with all-zeros to derive the
+   * key.  The default zero-init satisfies this. */
+
+  /* Initialise the bihash for the IPv6 fwding table. */
+  clib_bihash_init_24_8 (&ip6_fib_fwding_table.ip6_hash,
+			 "fuzz ip6 fwding", 1024, 16ULL << 20);
+
+  /* Insert the default route: key = (0, 0, fib_index << 32 | 0),
+   * value = LB index 0. */
+  clib_bihash_kv_24_8_t kv6;
+  memset (&kv6, 0, sizeof (kv6));
+  kv6.key[0] = 0;
+  kv6.key[1] = 0;
+  kv6.key[2] = ((u64) 0) << 32 | 0; /* fib_index=0, prefix_len=0 */
+  kv6.value = 0;		    /* LB index 0 */
+  clib_bihash_add_del_24_8 (&ip6_fib_fwding_table.ip6_hash, &kv6,
+			    1 /* add */);
+}
+
 void
 harness_init_once (void)
 {
@@ -462,6 +596,11 @@ harness_init_once (void)
   sfw_main.session_timeout = 30.0;
   sfw_main.vnet_main = vnet_get_main ();
   sfw_feature_init (&sfw_main);
+
+  /* 11. v2.2 — policy + FIB fixture so the inline body's classify
+   *     path actually fires.  See harness_setup_policy_fib_fixture
+   *     for the layout. */
+  harness_setup_policy_fib_fixture ();
 
   fuzz_initialized = 1;
 }

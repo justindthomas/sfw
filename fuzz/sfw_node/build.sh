@@ -15,11 +15,12 @@
 #   runtime data + functions sfw .c files reach for outside
 #   libvppinfra.
 #
-# v2.1 scope (this script): every TU compiles, every symbol resolves
-# at link time, and the harness body invokes sfw_ip{4,6}_node_fn on
-# the fuzzer-supplied bytes loaded into a single synthesised
-# vlib_buffer.  v2.2 will lift policy / NAT / FIB coverage by
-# hand-filling sm->if_config + one zone-pair (see README.md).
+# v2.2 scope (this script): same v2.1 chassis plus the policy + FIB
+# fixture (sm->if_config[0]=zone 2, zone-pair 2->1 with permit-
+# stateful policy, ip4_fib_16s + ip4_mtrie + load_balance_pool +
+# ip6_fib_fwding_table.ip6_hash all minimally populated so
+# sfw_resolve_dst_zone{4,6} returns SFW_ZONE_LOCAL).  Coverage
+# uplift v2.1->v2.2: ip4 342->445, ip6 310->455.
 #
 # Usage:  build.sh [output-dir]
 #         (default output-dir: /src/fuzz/sfw_node/out)
@@ -61,6 +62,12 @@ echo "--- compile bihash_inst.o ---"
 clang $COMMON_CFLAGS $SAN_OBJ_FLAGS $INCLUDES \
     -c "$HERE/bihash_inst.c" -o "$OUT/bihash_inst.o"
 
+# v2.2: ip6_fib_fwding_table.ip6_hash uses bihash_24_8; same template
+# pattern, separate TU because the {48,24}_8 header macro sets clash.
+echo "--- compile bihash_inst_24_8.o ---"
+clang $COMMON_CFLAGS $SAN_OBJ_FLAGS $INCLUDES \
+    -c "$HERE/bihash_inst_24_8.c" -o "$OUT/bihash_inst_24_8.o"
+
 ##############################################################################
 # Step 3: compile the chassis glue (VPP runtime globals + function
 # stubs).  Same flags so coverage instrumentation lines up across all
@@ -86,6 +93,7 @@ build_harness() {
         "$OUT/sfw_nat.o" \
         "$OUT/sfw_nat64.o" \
         "$OUT/bihash_inst.o" \
+        "$OUT/bihash_inst_24_8.o" \
         "$OUT/harness_glue.o" \
         -lvppinfra \
         -o "$OUT/$target"

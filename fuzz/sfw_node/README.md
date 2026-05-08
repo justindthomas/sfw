@@ -9,32 +9,32 @@ forward / NAT64 return), and the per-thread LRU bookkeeping.
 
 ## Status
 
-**v2.1: driveable — sfw_ip{4,6}_inline runs against fuzzer input.**
+**v2.2: driveable + classifier-reaching — policy match,
+session-create, FIB lookup all wired.**
 
 The full sfw plugin (sfw.c, sfw_node.c, sfw_session.c, sfw_rules.c,
 sfw_nat.c, sfw_nat64.c) compiles with `-fsanitize=address,undefined,
-fuzzer-no-link`, the `bihash_48_8` template instantiates standalone,
-and the chassis (`harness_glue.c` + `harness_init.h`) brings up just
-enough VPP runtime — buffer arena + `vm->buffer_main`, `node_main` /
-`error_main` for `vlib_node_increment_counter`, a no-op
-`buffer_enqueue_to_next_fn`, `feature_main.feature_config_mains[0]`
-for `vnet_feature_next`, `ip{4,6}_main.fib_index_by_sw_if_index`, and
-`sfw_main` via `sfw_feature_init` (nworkers=0) — so the per-frame
-inline node body runs against a single synthesised buffer.
+fuzzer-no-link`, the `bihash_{48,24}_8` templates instantiate
+standalone, and the chassis (`harness_glue.c` + `harness_init.h`)
+brings up enough VPP runtime to drive `sfw_ip{4,6}_inline` against
+fuzzer-supplied bytes. v2.2 adds the policy + FIB fixture so the
+per-packet loop reaches the classify / session-create / NAT /
+session-insert path on every iteration whose IP+L4 parse succeeds.
 
 ```
-$ ./out/fuzz_sfw_ip4_node -max_total_time=5
-#1570852  DONE  cov: 342 ft: 343  exec/s: 261808
-$ ./out/fuzz_sfw_ip6_node -max_total_time=5
-#1596352  DONE  cov: 310 ft: 311  exec/s: 266058
+$ ./out/fuzz_sfw_ip4_node -max_total_time=8
+#2020164  DONE  cov: 445 ft: 446  exec/s: 224462
+$ ./out/fuzz_sfw_ip6_node -max_total_time=8
+#2040020  DONE  cov: 455 ft: 456  exec/s: 226668
 ```
 
-342 / 310 covered edges (versus `cov:1` in v2.0) means the parser,
-L4 extractor, and bihash search all see the fuzzer's input on every
-iteration. The session-create / NAT / NAT64 / policy paths remain
-unreached because `sm->if_config` is empty — `src_zone` resolves to
-`SFW_ZONE_NONE` and the per-packet loop falls through PERMIT. Lifting
-that is v2.2+ work (see "Roadmap to v2.2" below).
+Coverage progression across versions:
+
+| Version | IPv4 cov | IPv6 cov | What's reachable |
+|---------|---------:|---------:|------------------|
+| v2.0    |        1 |        1 | placeholder (entry/exit only) |
+| v2.1    |      342 |      310 | parse + L4-extract + bihash search |
+| v2.2    |      445 |      455 | + policy match + session create + FIB lookup |
 
 ## Layout
 
@@ -42,8 +42,9 @@ that is v2.2+ work (see "Roadmap to v2.2" below).
 fuzz/sfw_node/
 ├── Dockerfile                      # FROM audit-tools:vpp-fuzz
 ├── build.sh                        # compile sfw .c + chassis + harnesses
-├── bihash_inst.c                   # 2-line clib_bihash_48_8 instantiation
-├── harness_glue.c                  # VPP runtime globals + stubs + v2.1 fixture
+├── bihash_inst.c                   # clib_bihash_48_8 (sfw session table)
+├── bihash_inst_24_8.c              # clib_bihash_24_8 (ip6_fib_fwding_table)
+├── harness_glue.c                  # VPP runtime globals + stubs + v2.{1,2} fixture
 ├── harness_init.h                  # public surface: harness_init_once,
 │                                   # harness_load_packet, fuzz_get_main, ...
 ├── fuzz_sfw_ip4_node.c             # drives sfw_ip4_node_fn on fuzzer input
@@ -80,9 +81,12 @@ entrypoints with the same signatures so the linker resolves cleanly.
 | ICMP{4,6}-translate helpers           | mirrored only       | yes (header-inlined)     | yes (header-inlined)     |
 | `sfw_ip{4,6}_inline` parse + L4-extract | no                | no                       | **yes (v2.1)**           |
 | Bihash session search                 | no                  | no                       | **yes (v2.1)**           |
-| Zone-pair policy match                | no                  | no                       | v2.2+ (needs if_config)  |
-| Action dispatch (permit/deny/NAT)     | no                  | no                       | v2.2+ (needs if_config)  |
-| Bihash session insert / LRU update    | no                  | no                       | v2.2+ (needs policy hit) |
+| Zone-pair policy match                | no                  | no                       | **yes (v2.2)**           |
+| Action dispatch (permit/deny/NAT)     | no                  | no                       | **yes (v2.2)**           |
+| FIB lookup (mtrie / bihash24_8)       | no                  | no                       | **yes (v2.2)**           |
+| Bihash session insert                 | no                  | no                       | **yes (v2.2)**           |
+| Stateful NAT path (SNAT / DNAT)       | no                  | no                       | v2.3+ (needs nat_pools)  |
+| LRU bookkeeping (multi-iter)          | no                  | no                       | v2.3+ (stateful fuzzer)  |
 | `sfw_api.c` handler mutators          | partial (one fn)    | no                       | **see `../sfw_api/` (Tier 2 #5)** |
 
 ## Architecture
@@ -113,7 +117,7 @@ then links each harness against:
        `adj_get_sw_if_index`, plus stubs for the sfw IPv6-RA module
        entrypoints (`sfw_pref64_*`, `sfw_rdnss_*`,
        `sfw_plugin_api_hookup`) whose source is excluded.
-    3. **v2.1 fixture (`harness_init_once` / `harness_load_packet`)**:
+    3. **v2.1 chassis (`harness_init_once` / `harness_load_packet`)**:
        brings up the vppinfra main heap (`clib_mem_init_thread_safe`),
        a single `vlib_buffer_t` slot at `vm->buffer_main->buffer_mem_start`,
        a `vlib_frame_t` carrying buffer index 0, `vm->node_main.nodes[0]`
@@ -125,39 +129,51 @@ then links each harness against:
        `next0=0`, `ip{4,6}_main.fib_index_by_sw_if_index = vec[1]={0}`,
        and `sfw_main` via `sfw_feature_init` after pinning
        `vlib_thread_main.n_vlib_mains=1` (so `vlib_num_workers()=0`).
+    4. **v2.2 policy + FIB fixture (`harness_setup_policy_fib_fixture`)**:
+       assigns `sm->if_config[0].zone_id = 2` ("external"), declares
+       zone 2 in `sm->zones[]`, binds zone-pair (2 → 1) and (1 → 2)
+       to a wildcard `permit-stateful` policy, then constructs the
+       minimal FIB so `sfw_resolve_dst_zone{4,6}` returns
+       `SFW_ZONE_LOCAL`:
+         - **IPv4**: `pool_get_zero(ip4_fib_16s)` for the FIB; mtrie
+           `root_ply.leaves[i] = (0<<1)|1` (terminal, LB index 0) for
+           every 16-bit slot.
+         - **IPv6**: `clib_bihash_init_24_8(&ip6_fib_fwding_table.
+           ip6_hash, ...)` plus a default-route entry, with
+           `prefix_lengths_in_search_order = [0]`.
+         - **Both**: `pool_get_zero(load_balance_pool)` for LB index
+           0 with `lb_n_buckets=1` and the inline bucket's
+           `dpoi_type = DPO_RECEIVE`.
 - `libvppinfra` — same as v1.
 
-## Roadmap to v2.2
+## Roadmap to v2.3
 
-What v2.1 does **not** yet do: cover policy match, action dispatch,
-session create / NAT translation, or the LRU update path. The reason:
-`sm->if_config` is empty, so `src_zone == SFW_ZONE_NONE` for every
-packet and the inline body falls through PERMIT before reaching any
-of those branches. To open that coverage:
+What v2.2 does **not** yet do: cover the stateful-NAT branches
+(`SFW_ACTION_PERMIT_STATEFUL_NAT`), deterministic-NAT slot scan, and
+the cross-frame LRU update path. The default policy is plain
+`permit-stateful` so `sfw_nat_translate_source` is never invoked.
+To open that coverage:
 
-1. **Populate `sm->if_config`**. `sfw_enable_disable_interface` does
-   this in production but reaches into `sm->vnet_main->interface_main.
-   sw_interfaces` (a pool). For the harness, hand-fill
-   `sm->if_config` directly via `vec_validate` + assign zone_id to
-   index 0 (and a second non-zero index if we want to fuzz cross-zone
-   policy too).
+1. **Add one NAT pool.** `vec_add1(sm->nat_pools, ...)` with a
+   dynamic pool that maps any internal address to a single external
+   address + port range, plus the per-thread allocator state
+   (`sm->v4_port_allocs[0]`).  Then change the default-policy action
+   to `SFW_ACTION_PERMIT_STATEFUL_NAT` so the SNAT translation
+   pre-compute fires on every flow.
 
-2. **Install one zone-pair policy**. `sfw_zone_pair_set` materialises
-   `sm->zone_pairs_by_table[fib_index]` and the rule chain.  Hand-fill
-   one pair (e.g. zone 1 → zone 2, action permit-stateful + a single
-   tuple rule) so policy-match and the SNAT path become reachable.
+2. **Multi-iteration / stateful fuzzer.** libfuzzer's single-shot
+   model means each iteration starts with sm->session_hash empty
+   (well — populated only by previous iterations until evicted).
+   The LRU-touch path activates when an iteration's bihash search
+   returns an existing session.  Either drive it with a
+   structure-aware mutator that emits a sequence of related packets,
+   or accept the cumulative-state nature and let the corpus shape
+   itself over time.
 
-3. **Optional: NAT pool init**. Without `sm->nat_pools` populated,
-   `sfw_nat_translate_source` returns failure, so the harness only
-   reaches the SFW_ACTION_DENY branch on NAT exhaustion.  Adding one
-   deterministic pool would also light up the deterministic-NAT slot
-   scan we have at `sfw_node.c:736`.
-
-The FIB-lookup path inside `sfw_resolve_dst_zone4`/`...zone6` is the
-hard one: it reaches `ip4_fib_forwarding_lookup` which dereferences
-`ip4_main.fibs[]`, `ip4_fib_16s`, and the mtrie ply pool. Stubbing
-the resolver via `--wrap=sfw_resolve_dst_zone4` (and v6 mirror) is
-likely cheaper than building a real FIB.
+3. **Frame-of-N harness.** Currently `frame->n_vectors = 1`.
+   Bumping to 4-8 buffers per call would exercise the per-frame
+   `nexts[i]` and meta[] arrays' boundary handling — useful since
+   v1's NAT64 trigger F12 was a frame-boundary bug.
 
 ## Findings to date
 
