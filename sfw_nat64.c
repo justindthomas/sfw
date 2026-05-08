@@ -481,6 +481,29 @@ sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
 
   if (protocol == IP_PROTOCOL_ICMP)
     {
+      /* VPP's icmp_to_icmp6 (vnet/ip/ip4_to_ip6.h) calls os_panic() if
+       * the embedded inner header in an ICMP error reports a protocol
+       * other than TCP/UDP/ICMP. An attacker on the v4 side can reach
+       * that path with a crafted ICMPv4 error carrying e.g. an inner
+       * ESP/GRE/SCTP header — remote DoS on the data plane. Pre-screen
+       * those before handing the buffer to the helper. */
+      icmp46_header_t *outer_icmp = (icmp46_header_t *) (ip4 + 1);
+      u8 t = outer_icmp->type;
+      if (t == ICMP4_destination_unreachable ||
+	  t == ICMP4_time_exceeded ||
+	  t == ICMP4_parameter_problem)
+	{
+	  /* Inner IPv4 header sits 8 bytes past the outer ICMP header. */
+	  if (b->current_length <
+	      sizeof (ip4_header_t) + 8 + sizeof (ip4_header_t))
+	    return -1;
+	  ip4_header_t *inner = (ip4_header_t *) ((u8 *) outer_icmp + 8);
+	  u8 ip = inner->protocol;
+	  if (ip != IP_PROTOCOL_TCP && ip != IP_PROTOCOL_UDP &&
+	      ip != IP_PROTOCOL_ICMP)
+	    return -1;
+	}
+
       int rv = icmp_to_icmp6 (b, sfw_nat64_v4_to_v6_outer_cb, &ctx,
 			      sfw_nat64_v4_to_v6_inner_cb, &ctx);
       if (rv != 0)
