@@ -409,6 +409,35 @@ sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
       u16 declared_pl = clib_net_to_host_u16 (ip6->payload_length);
       if (declared_pl > b->current_length - sizeof (ip6_header_t))
 	return -1;
+
+      /* F9: same shape as F8 but on the INNER header carried in an
+       * ICMP6 error's body. The helper at vnet/ip/ip6_to_ip4.h:470
+       * computes inner_ip4->length from inner_ip6->payload_length and
+       * walks `inner_ip4->length - sizeof(ip4_header_t)` bytes through
+       * `ip_incremental_checksum`. inner_ip6->payload_length is an
+       * independent attacker-controlled u16 — F8's outer bound doesn't
+       * cover it. Only error-type ICMP6 packets carry an inner; gate
+       * on type so legitimate echo packets aren't mis-rejected by the
+       * read-as-payload-length of arbitrary echo data. */
+      icmp46_header_t *outer_icmp6 = (icmp46_header_t *) (ip6 + 1);
+      u8 t6 = outer_icmp6->type;
+      if (t6 == ICMP6_destination_unreachable ||
+	  t6 == ICMP6_packet_too_big ||
+	  t6 == ICMP6_time_exceeded ||
+	  t6 == ICMP6_parameter_problem)
+	{
+	  /* Inner IPv6 header sits 8 bytes past the outer ICMP6 header.
+	   * F5/F6 already required current_length >= 106 = 40+8+40+18,
+	   * so the inner ip6 header is fully readable here. */
+	  ip6_header_t *inner_ip6 =
+	    (ip6_header_t *) ((u8 *) outer_icmp6 + sizeof (icmp46_header_t));
+	  u16 inner_pl = clib_net_to_host_u16 (inner_ip6->payload_length);
+	  size_t inner_pl_offset =
+	    sizeof (ip6_header_t) + sizeof (icmp46_header_t) +
+	    sizeof (ip6_header_t);
+	  if (inner_pl > b->current_length - inner_pl_offset)
+	    return -1;
+	}
       /* Core VPP helper handles the entire rewrite including header
        * shrink (vlib_buffer_advance), pseudo-header fixup, inner-packet
        * recursion for error messages, echo type translation, and L4
@@ -543,8 +572,14 @@ sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
        * (CWE-125 + CWE-200). The F5/F6 pre-check below only fires for
        * error types — echo requests bypass it and can hit the helper
        * with a 28-byte buffer claiming a 65535-byte length. Validate
-       * up front, mirroring F7's drop-on-mismatch per RFC 7915 §4.5. */
-      if (ip_len > b->current_length)
+       * up front, mirroring F7's drop-on-mismatch per RFC 7915 §4.5.
+       *
+       * F10: also require ip_len >= sizeof(ip4_header_t). Without
+       * the lower bound the helper computes
+       *   ip6->payload_length = htons(ntohs(ip4->length) - 20)
+       * which wraps the u16 to ~65500 when ip4->length < 20, then
+       * walks ~65 KB past the buffer (CWE-191 + CWE-125 + CWE-200). */
+      if (ip_len < sizeof (ip4_header_t) || ip_len > b->current_length)
 	return -1;
 
       /* VPP's icmp_to_icmp6 (vnet/ip/ip4_to_ip6.h) calls os_panic() if
@@ -574,6 +609,20 @@ sfw_nat64_translate_v4_to_v6 (vlib_main_t *vm, vlib_buffer_t *b,
 	  u8 ip = inner->protocol;
 	  if (ip != IP_PROTOCOL_TCP && ip != IP_PROTOCOL_UDP &&
 	      ip != IP_PROTOCOL_ICMP)
+	    return -1;
+
+	  /* F9 (v4→v6 sibling): bound inner_ip4->length the same way F8
+	   * bounds the outer. The helper at vnet/ip/ip4_to_ip6.h:402
+	   * walks `ntohs(inner_ip6->payload_length)` bytes for the inner
+	   * ICMP recompute, where inner_ip6->payload_length =
+	   * htons(ntohs(inner_ip4->length) - 20). The same lower-bound
+	   * guard from F10 (length < sizeof(ip4_header_t) → wrap to ~65500)
+	   * applies on the inner header too. */
+	  size_t inner_ip4_offset =
+	    sizeof (ip4_header_t) + sizeof (icmp46_header_t);
+	  u16 inner_len = clib_net_to_host_u16 (inner->length);
+	  if (inner_len < sizeof (ip4_header_t) ||
+	      inner_len > b->current_length - inner_ip4_offset)
 	    return -1;
 	}
 
