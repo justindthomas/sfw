@@ -39,6 +39,24 @@ sfw_nat64_embed_v4 (const ip6_address_t *prefix, u8 prefix_len,
 		    const ip4_address_t *v4, ip6_address_t *out_v6)
 {
   clib_memset (out_v6, 0, sizeof (*out_v6));
+
+  /* Reject prefix lengths outside RFC 6052 §2.2's set before reading
+   * any prefix bytes. Both ingress paths (CLI sfw_nat64_plen_valid in
+   * sfw.c, binary API sfw_nat64_api_plen_valid in sfw_api.c) already
+   * filter — but a length > 128 reaching this function would compute
+   * pfx_bytes > 16 in the memcpy below and read past prefix->as_u8[15]
+   * into adjacent caller memory, then write those bytes into the
+   * synthesized IPv6 destination on the wire (CWE-125 + CWE-200).
+   * Re-validate here so the disclosure primitive can't be revived by
+   * a future ingress path that forgets the check. */
+  switch (prefix_len)
+    {
+    case 32: case 40: case 48: case 56: case 64: case 96:
+      break;
+    default:
+      return;
+    }
+
   /* Copy the prefix bits first — the u-octet and remainder will be
    * overwritten for short prefixes below. */
   u8 pfx_bytes = prefix_len / 8;
@@ -77,11 +95,6 @@ sfw_nat64_embed_v4 (const ip6_address_t *prefix, u8 prefix_len,
       /* [12..15] = v4 */
       clib_memcpy_fast (&out_v6->as_u8[12], &v4->as_u8[0], 4);
       break;
-    default:
-      /* Config validation should prevent us reaching here. Zero-fill
-       * leaves the v4 embedded as 0.0.0.0 so any extract immediately
-       * fails the prefix match — observable rather than silent. */
-      break;
     }
 }
 
@@ -89,6 +102,20 @@ int
 sfw_nat64_extract_v4 (const ip6_address_t *prefix, u8 prefix_len,
 		      const ip6_address_t *v6, ip4_address_t *out_v4)
 {
+  /* Same defense as sfw_nat64_embed_v4: a `prefix_len > 128` reaching
+   * here would compute pfx_bytes > 16 and the memcmp below would read
+   * past the 16-byte v6 / prefix buffers. The original audit (F4)
+   * declared this function safe by inspection of its switch's
+   * default-return arm — but the OOB is in the pre-switch memcmp,
+   * not the switch itself. */
+  switch (prefix_len)
+    {
+    case 32: case 40: case 48: case 56: case 64: case 96:
+      break;
+    default:
+      return -1;
+    }
+
   u8 pfx_bytes = prefix_len / 8;
   if (pfx_bytes && clib_memcmp (v6->as_u8, prefix->as_u8, pfx_bytes) != 0)
     return -1;
