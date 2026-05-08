@@ -15,10 +15,38 @@ fuzz/sfw_full/
 ├── fuzz_translate_v6_to_v4.c        # full v6→v4 translator harness
 ├── fuzz_translate_v4_to_v6.c        # full v4→v6 translator harness
 ├── triggers/
-│   ├── F8_v6_to_v4.c                # ICMP6 echo + payload_length=0xFFFF
-│   └── F8_v4_to_v6.c                # ICMP4 echo + total_length=0xFFFF
+│   ├── F*_*.c                       # standalone executable reproducers
+│   └── dump_corpus_seeds.py         # writes corpus/<harness>/closed/*.bin
+├── corpus/
+│   └── <harness>/closed/<id>.bin    # libFuzzer-format closed-finding seeds
+│                                    # replayed by audit-tools/regression-check.sh
 └── README.md                        # this file
 ```
+
+## Closed-finding regression corpus
+
+Every fixed finding (F8, F9, F9.1, F10, F11) has its minimal trigger
+committed twice:
+
+- as a standalone executable C reproducer in `triggers/<id>.c` for ad-hoc
+  inspection (`./out/F8_v6_to_v4` etc.);
+- as a raw libFuzzer-format byte file in `corpus/<harness>/closed/<id>.bin`
+  for `regression-check.sh` to replay on every commit.
+
+`triggers/dump_corpus_seeds.py` is the source of truth for the binary
+seeds: re-run it after a new finding is closed to refresh the corpus.
+
+```bash
+# Inside audit-tools:vpp-fuzz container (the harnesses link
+# libvppinfra.so.25.10, only present in the container):
+podman run --rm -v ~/code/sfw:/src:Z -v ~/code/audit-tools:/audit:Z \
+    localhost/audit-tools:vpp-fuzz \
+    -c "/audit/regression-check.sh /src"
+# exit 0 = clean, exit 1 = a closed finding has reopened.
+```
+
+Last validated 2026-05-08: 6 seeds across 2 harnesses replay clean
+against `master` (`11c5227`).
 
 ## Build
 

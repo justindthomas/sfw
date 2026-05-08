@@ -1,5 +1,11 @@
 out/
+# Transient libFuzzer corpus (campaign growth) is ignored, but the
+# closed/<id>.bin regression seeds under each <harness>/ are committed.
 corpus/
+!corpus/
+!corpus/*/
+!corpus/*/closed/
+!corpus/*/closed/**
 artifacts/
 *.o
 *.a
