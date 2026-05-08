@@ -224,6 +224,8 @@ sfw_policy_create (sfw_main_t *sm, const char *name, u32 from_zone_id,
   sfw_policy_t *p;
 
   p = clib_mem_alloc (sizeof (*p));
+  if (PREDICT_FALSE (!p))
+    return 0;
   clib_memset (p, 0, sizeof (*p));
   strncpy (p->name, name, sizeof (p->name) - 1);
   p->name[sizeof (p->name) - 1] = 0;
