@@ -426,6 +426,21 @@ sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
 	  t6 == ICMP6_time_exceeded ||
 	  t6 == ICMP6_parameter_problem)
 	{
+	  /* F10 sibling on the v6→v4 outer: the inner-error branch of
+	   * `icmp6_to_icmp` sets ip4->length = payload_length (not
+	   * payload_length + 20 like the echo branch — see helper
+	   * line 514-516), then walks `ip4->length - sizeof(ip4_header_t)`
+	   * bytes for the outer-checksum recompute (line 521). With
+	   * payload_length < 20 the subtraction wraps the u16 to
+	   * ~65500 and walks ~64 KB past the buffer (CWE-191 +
+	   * CWE-125 + CWE-200). Reject under-minimum payload_length
+	   * — a legitimate ICMP6 error carries at minimum the
+	   * 8-byte outer ICMP6 header plus a 40-byte inner ip6
+	   * header, so payload_length must be ≥ 48 for any error
+	   * type to make structural sense. */
+	  if (declared_pl < 8 + sizeof (ip6_header_t))
+	    return -1;
+
 	  /* Inner IPv6 header sits 8 bytes past the outer ICMP6 header.
 	   * F5/F6 already required current_length >= 106 = 40+8+40+18,
 	   * so the inner ip6 header is fully readable here.
@@ -446,6 +461,28 @@ sfw_nat64_translate_v6_to_v4 (vlib_main_t *vm, vlib_buffer_t *b,
 	  size_t inner_pl_offset =
 	    sizeof (ip6_header_t) + 8 + sizeof (ip6_header_t);
 	  if (inner_pl > b->current_length - inner_pl_offset)
+	    return -1;
+
+	  /* Reject inner v6 with extension headers. The helper at
+	   * vnet/ip/ip6_to_ip4.h drives `ip6_ext_header_walk` over the
+	   * inner chain, then computes inner_ip4 = inner_l4 - 20 and
+	   * does a memcpy/pointer-arith chain at lines 489-491. With
+	   * crafted inner extension headers the walk produces an
+	   * inner_l4 placement where those subtractions underflow into
+	   * adjacent stack/buffer memory — UBSan flags the pointer arith
+	   * and ASan eventually catches an OOB read past current_length.
+	   * sfw's inner cb (sfw_nat64_v6_to_v4_inner_cb) also assumes no
+	   * extension headers (`l4 = ip6 + sizeof(ip6_header_t)`). The
+	   * conservative defense is to whitelist inner protocols to
+	   * known L4s — same shape as F2's v4→v6 inner-protocol pre-
+	   * screen — and let the helper handle only the no-ext-header
+	   * case. Real ICMP6 errors carrying inner v6 with extension
+	   * headers are rare in practice; dropping them is safer than
+	   * trusting the helper's chain walk. */
+	  u8 inner_proto6 = inner_ip6->protocol;
+	  if (inner_proto6 != IP_PROTOCOL_TCP &&
+	      inner_proto6 != IP_PROTOCOL_UDP &&
+	      inner_proto6 != IP_PROTOCOL_ICMP6)
 	    return -1;
 	}
       /* Core VPP helper handles the entire rewrite including header
