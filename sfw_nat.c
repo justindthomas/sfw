@@ -225,7 +225,7 @@ sfw_nat_dynamic_translate (sfw_main_t *sm, sfw_nat_pool_t *pool,
 /* --- Public NAT API --- */
 
 int
-sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
+sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index, u32 table_id,
 			  ip4_address_t *src_addr, u16 src_port, u8 protocol,
 			  ip4_address_t *dst_addr, ip4_address_t *out_addr,
 			  u16 *out_port, u8 *out_mode, u32 *out_alloc_idx)
@@ -240,6 +240,11 @@ sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
        * pools advertise a v4 external range but are matched on the
        * v6 destination side by sfw_nat64_match_pool. */
       if (pool->kind != SFW_POOL_KIND_NAT44)
+	continue;
+
+      /* VRF guard: pool only matches packets from its configured VRF.
+       * Two VRFs with overlapping internal prefixes get distinct pools. */
+      if (pool->table_id != table_id)
 	continue;
 
       /* Check if source address falls within this pool's internal range */
@@ -290,8 +295,8 @@ sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
 }
 
 sfw_nat_static_t *
-sfw_nat_find_dnat (sfw_main_t *sm, ip4_address_t *dst_addr, u16 dst_port,
-		   u8 protocol)
+sfw_nat_find_dnat (sfw_main_t *sm, u32 table_id, ip4_address_t *dst_addr,
+		   u16 dst_port, u8 protocol)
 {
   u32 i;
   u16 dst_port_h = clib_net_to_host_u16 (dst_port);
@@ -300,6 +305,8 @@ sfw_nat_find_dnat (sfw_main_t *sm, ip4_address_t *dst_addr, u16 dst_port,
   for (i = 0; i < vec_len (sm->nat_statics); i++)
     {
       sfw_nat_static_t *s = &sm->nat_statics[i];
+      if (s->table_id != table_id)
+	continue;
       if (s->external_addr.as_u32 != dst_addr->as_u32)
 	continue;
 

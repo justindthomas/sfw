@@ -38,7 +38,9 @@ sfw_feature_init (sfw_main_t *sm)
    * DPO_RECEIVE, so operators can write policies like external->local
    * to gate traffic destined for the router itself. */
   clib_memset (sm->zones, 0, sizeof (sm->zones));
-  clib_memset (sm->zone_pairs, 0, sizeof (sm->zone_pairs));
+  /* Per-VRF zone-pair slabs are allocated lazily by
+   * sfw_zone_pair_set when the first policy in that VRF is added. */
+  sm->zone_pairs_by_table = 0;
   strncpy (sm->zones[SFW_ZONE_LOCAL].name, "local",
 	   sizeof (sm->zones[SFW_ZONE_LOCAL].name) - 1);
   sm->zones[SFW_ZONE_LOCAL].zone_id = SFW_ZONE_LOCAL;
@@ -118,6 +120,89 @@ sfw_zone_find_or_create (sfw_main_t *sm, const char *name)
   return id;
 }
 
+/* --- Per-VRF zone-pair table helpers --- */
+
+sfw_policy_t *
+sfw_zone_pair_get (sfw_main_t *sm, u32 table_id, u32 from_zone_id,
+		   u32 to_zone_id)
+{
+  if (table_id >= vec_len (sm->zone_pairs_by_table))
+    return 0;
+  sfw_zone_pair_slab_t *slab = &sm->zone_pairs_by_table[table_id];
+  if (!slab->zone_pairs)
+    return 0;
+  if (from_zone_id >= SFW_MAX_ZONES || to_zone_id >= SFW_MAX_ZONES)
+    return 0;
+  u32 idx = from_zone_id * SFW_MAX_ZONES + to_zone_id;
+  return slab->zone_pairs[idx].policy;
+}
+
+int
+sfw_zone_pair_set (sfw_main_t *sm, u32 table_id, u32 from_zone_id,
+		   u32 to_zone_id, sfw_policy_t *p)
+{
+  if (from_zone_id >= SFW_MAX_ZONES || to_zone_id >= SFW_MAX_ZONES)
+    return -1;
+  vec_validate (sm->zone_pairs_by_table, table_id);
+  sfw_zone_pair_slab_t *slab = &sm->zone_pairs_by_table[table_id];
+  if (!slab->zone_pairs)
+    {
+      vec_validate (slab->zone_pairs, SFW_MAX_ZONES * SFW_MAX_ZONES - 1);
+      clib_memset (slab->zone_pairs, 0,
+		   sizeof (sfw_zone_pair_t) * SFW_MAX_ZONES * SFW_MAX_ZONES);
+    }
+  u32 idx = from_zone_id * SFW_MAX_ZONES + to_zone_id;
+  slab->zone_pairs[idx].policy = p;
+  slab->n_policies++;
+  return 0;
+}
+
+void
+sfw_zone_pair_clear (sfw_main_t *sm, u32 table_id, u32 from_zone_id,
+		     u32 to_zone_id)
+{
+  if (table_id >= vec_len (sm->zone_pairs_by_table))
+    return;
+  sfw_zone_pair_slab_t *slab = &sm->zone_pairs_by_table[table_id];
+  if (!slab->zone_pairs)
+    return;
+  if (from_zone_id >= SFW_MAX_ZONES || to_zone_id >= SFW_MAX_ZONES)
+    return;
+  u32 idx = from_zone_id * SFW_MAX_ZONES + to_zone_id;
+  if (slab->zone_pairs[idx].policy)
+    {
+      slab->zone_pairs[idx].policy = 0;
+      if (slab->n_policies > 0)
+	slab->n_policies--;
+      if (slab->n_policies == 0)
+	{
+	  vec_free (slab->zone_pairs);
+	  slab->zone_pairs = 0;
+	}
+    }
+}
+
+void
+sfw_zone_pair_foreach (sfw_main_t *sm, sfw_zone_pair_cb_t cb, void *opaque)
+{
+  u32 t, f, to;
+  for (t = 0; t < vec_len (sm->zone_pairs_by_table); t++)
+    {
+      sfw_zone_pair_slab_t *slab = &sm->zone_pairs_by_table[t];
+      if (!slab->zone_pairs)
+	continue;
+      for (f = 0; f < SFW_MAX_ZONES; f++)
+	for (to = 0; to < SFW_MAX_ZONES; to++)
+	  {
+	    sfw_policy_t *p = slab->zone_pairs[f * SFW_MAX_ZONES + to].policy;
+	    if (!p)
+	      continue;
+	    if (cb (sm, t, f, to, p, opaque))
+	      return;
+	  }
+    }
+}
+
 /* --- Policy management helpers --- */
 
 sfw_policy_t *
@@ -134,7 +219,7 @@ sfw_policy_find (sfw_main_t *sm, const char *name)
 
 sfw_policy_t *
 sfw_policy_create (sfw_main_t *sm, const char *name, u32 from_zone_id,
-		   u32 to_zone_id)
+		   u32 to_zone_id, u32 table_id)
 {
   sfw_policy_t *p;
 
@@ -144,14 +229,14 @@ sfw_policy_create (sfw_main_t *sm, const char *name, u32 from_zone_id,
   p->name[sizeof (p->name) - 1] = 0;
   p->from_zone_id = from_zone_id;
   p->to_zone_id = to_zone_id;
+  p->table_id = table_id;
   p->default_action = SFW_ACTION_DENY;
   p->implicit_icmpv6 = 1; /* enabled by default */
 
   vec_add1 (sm->policies, p);
 
-  /* Install in zone-pair table */
-  u32 zp_index = from_zone_id * SFW_MAX_ZONES + to_zone_id;
-  sm->zone_pairs[zp_index].policy = p;
+  /* Install in per-VRF zone-pair table */
+  sfw_zone_pair_set (sm, table_id, from_zone_id, to_zone_id, p);
 
   /* Enable feature on all interfaces in both zones */
   u32 i;
@@ -171,10 +256,8 @@ sfw_policy_delete (sfw_main_t *sm, sfw_policy_t *p)
   if (!p)
     return;
 
-  /* Detach from zone-pair table */
-  u32 zp_index = p->from_zone_id * SFW_MAX_ZONES + p->to_zone_id;
-  if (sm->zone_pairs[zp_index].policy == p)
-    sm->zone_pairs[zp_index].policy = 0;
+  /* Detach from per-VRF zone-pair table */
+  sfw_zone_pair_clear (sm, p->table_id, p->from_zone_id, p->to_zone_id);
 
   /* Under workers, rule vec reads need to be serialized with a
    * barrier before the backing storage disappears. Only sync if
@@ -244,11 +327,14 @@ sfw_zone_command_fn (vlib_main_t *vm, unformat_input_t *input,
   vec_validate_init_empty (sm->if_config, sw_if_index, (sfw_if_config_t){ 0 });
   sm->if_config[sw_if_index].zone_id = zone_id;
 
-  /* Enable feature arc on this interface if any zone-pair policy exists */
+  /* Enable feature arc on this interface if any zone-pair policy
+   * (in any VRF) references this zone — sfw_node still consults the
+   * packet's rx_fib_index at lookup time, but the feature must be
+   * armed on the interface for the node to run at all. */
   u32 i;
-  for (i = 0; i < SFW_MAX_ZONES * SFW_MAX_ZONES; i++)
+  for (i = 0; i < vec_len (sm->policies); i++)
     {
-      sfw_policy_t *p = sm->zone_pairs[i].policy;
+      sfw_policy_t *p = sm->policies[i];
       if (p && (p->from_zone_id == zone_id || p->to_zone_id == zone_id))
 	{
 	  sfw_enable_disable_interface (sm, sw_if_index, 1);
@@ -307,6 +393,7 @@ sfw_policy_command_fn (vlib_main_t *vm, unformat_input_t *input,
   char *policy_name = 0;
   char *from_zone_name = 0, *to_zone_name = 0;
   u8 have_from_zone = 0, have_to_zone = 0;
+  u32 table_id = 0;
   u8 have_default_action = 0;
   u8 default_action = SFW_ACTION_DENY;
   u8 have_rule = 0;
@@ -337,6 +424,8 @@ sfw_policy_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	have_from_zone = 1;
       else if (unformat (input, "to-zone %s", &to_zone_name))
 	have_to_zone = 1;
+      else if (unformat (input, "vrf %u", &table_id))
+	;
       else if (unformat (input, "default-action permit-stateful-nat"))
 	{
 	  default_action = SFW_ACTION_PERMIT_STATEFUL_NAT;
@@ -461,7 +550,7 @@ sfw_policy_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	  return clib_error_return (0, "too many zones");
 	}
 
-      p = sfw_policy_create (sm, policy_name, from_id, to_id);
+      p = sfw_policy_create (sm, policy_name, from_id, to_id, table_id);
     }
 
   vec_free (from_zone_name);
@@ -539,12 +628,13 @@ sfw_policy_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
 VLIB_CLI_COMMAND (sfw_policy_command, static) = {
   .path = "sfw policy",
-  .short_help = "sfw policy <name> from-zone <zone> to-zone <zone>\n"
-		"sfw policy <name> default-action permit|deny|permit-stateful\n"
-		"sfw policy <name> implicit-icmpv6 enable|disable\n"
-		"sfw policy <name> rule <N> permit-stateful|permit|deny "
-		"[src <prefix>] [dst <prefix>] [proto <num>] "
-		"[sport <lo>[-<hi>]] [dport <lo>[-<hi>]]",
+  .short_help =
+    "sfw policy <name> from-zone <zone> to-zone <zone> [vrf <id>]\n"
+    "sfw policy <name> default-action permit|deny|permit-stateful\n"
+    "sfw policy <name> implicit-icmpv6 enable|disable\n"
+    "sfw policy <name> rule <N> permit-stateful|permit|deny "
+    "[src <prefix>] [dst <prefix>] [proto <num>] "
+    "[sport <lo>[-<hi>]] [dport <lo>[-<hi>]]",
   .function = sfw_policy_command_fn,
 };
 
@@ -601,8 +691,12 @@ sfw_show_policy_command_fn (vlib_main_t *vm, unformat_input_t *input,
       const char *to_name =
 	(p->to_zone_id < sm->n_zones) ? sm->zones[p->to_zone_id].name : "?";
 
-      vlib_cli_output (vm, "Policy: %s (from-zone %s to-zone %s)", p->name,
-		       from_name, to_name);
+      if (p->table_id)
+	vlib_cli_output (vm, "Policy: %s (from-zone %s to-zone %s vrf %u)",
+			 p->name, from_name, to_name, p->table_id);
+      else
+	vlib_cli_output (vm, "Policy: %s (from-zone %s to-zone %s)", p->name,
+			 from_name, to_name);
       vlib_cli_output (vm, "  default-action: %s",
 		       ACTION_NAME (p->default_action));
       vlib_cli_output (vm, "  implicit-icmpv6: %s",

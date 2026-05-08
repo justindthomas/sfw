@@ -231,12 +231,18 @@ sfw_resolve_dst_zone6 (sfw_main_t *sm, u32 sw_if_index,
   return SFW_ZONE_NONE;
 }
 
-/* Look up the zone-pair policy. Returns NULL if no policy. */
+/* Look up the zone-pair policy in a specific VRF. Returns NULL if no
+ * policy in this (table_id, src_zone, dst_zone) combination. */
 static inline sfw_policy_t *
-sfw_zone_pair_policy (sfw_main_t *sm, u32 src_zone, u32 dst_zone)
+sfw_zone_pair_policy (sfw_main_t *sm, u32 table_id, u32 src_zone, u32 dst_zone)
 {
+  if (table_id >= vec_len (sm->zone_pairs_by_table))
+    return 0;
+  sfw_zone_pair_slab_t *slab = &sm->zone_pairs_by_table[table_id];
+  if (!slab->zone_pairs)
+    return 0;
   u32 idx = src_zone * SFW_MAX_ZONES + dst_zone;
-  return sm->zone_pairs[idx].policy;
+  return slab->zone_pairs[idx].policy;
 }
 
 /* True if the given src address is configured on this router — used on
@@ -298,6 +304,8 @@ typedef struct
 			  can free the allocated port. */
   u8 nat64_return; /* 1 if matched session has nat_type == SFW_NAT_NAT64
 		      and needs v4->v6 rewrite in pass 2 */
+  u32 rx_fib_index; /* ingress VRF fib_index — stamped on every key the
+		       packet builds in pass 1 and pass 2 */
 } sfw_pkt_meta_t;
 
 always_inline uword
@@ -338,6 +346,14 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       ip4_header_t *ip0 = vlib_buffer_get_current (bufs[i]);
       u32 sw_if_index0 = vnet_buffer (bufs[i])->sw_if_index[VLIB_RX];
+      /* Ingress VRF — every session key in this scope is stamped with
+       * this fib_index so two VRFs with overlapping addresses get
+       * distinct sessions. Carried into pass 2 via m->rx_fib_index. */
+      u32 rx_fib_index =
+	(sw_if_index0 < vec_len (ip4_main.fib_index_by_sw_if_index)) ?
+	  vec_elt (ip4_main.fib_index_by_sw_if_index, sw_if_index0) :
+	  0;
+      m->rx_fib_index = rx_fib_index;
 
       /* Skip broadcast/multicast/unspecified */
       u32 dst_h = clib_net_to_host_u32 (ip0->dst_address.as_u32);
@@ -386,6 +402,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       key->src_port = m->dst_port;
       key->dst_port = m->src_port;
       key->protocol = m->protocol;
+      key->table_id = rx_fib_index;
 
       if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
 	{
@@ -402,6 +419,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  key->src_port = m->src_port;
 	  key->dst_port = m->dst_port;
 	  key->protocol = m->protocol;
+	  key->table_id = rx_fib_index;
 
 	  if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
 	    {
@@ -496,7 +514,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
        * original destination. This gives us the correct zone-pair
        * policy (e.g., external→internal) for rule evaluation. */
       sfw_nat_static_t *dnat = sfw_nat_find_dnat (
-	sm, &ip0->dst_address, m->dst_port, m->protocol);
+	sm, rx_fib_index, &ip0->dst_address, m->dst_port, m->protocol);
 
       u32 dst_zone;
       if (dnat)
@@ -516,12 +534,13 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    sfw_resolve_dst_zone4 (sm, sw_if_index0, &ip0->dst_address);
 	}
 
-      /* Look up zone-pair policy (try both directions) */
-      sfw_policy_t *policy = sfw_zone_pair_policy (sm, src_zone, dst_zone);
+      /* Look up zone-pair policy (try both directions) in this VRF */
+      sfw_policy_t *policy =
+	sfw_zone_pair_policy (sm, rx_fib_index, src_zone, dst_zone);
       is_from_zone = 1;
       if (!policy)
 	{
-	  policy = sfw_zone_pair_policy (sm, dst_zone, src_zone);
+	  policy = sfw_zone_pair_policy (sm, rx_fib_index, dst_zone, src_zone);
 	  if (policy)
 	    is_from_zone = 0;
 	}
@@ -559,8 +578,8 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       if (!dnat && m->action == SFW_ACTION_PERMIT_STATEFUL_NAT)
 	{
 	  if (sfw_nat_translate_source (
-		sm, thread_index, &ip0->src_address, m->src_port,
-		m->protocol, &ip0->dst_address, &m->nat_addr,
+		sm, thread_index, rx_fib_index, &ip0->src_address,
+		m->src_port, m->protocol, &ip0->dst_address, &m->nat_addr,
 		&m->nat_port, &m->nat_mode, &m->nat_alloc_idx) == 0)
 	    {
 	      if (m->protocol == IP_PROTOCOL_ICMP)
@@ -643,6 +662,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      s->k4.src_port = m->dst_port;
 	      s->k4.dst_port = m->src_port;
 	      s->k4.protocol = m->protocol;
+	      s->k4.table_id = m->rx_fib_index;
 
 	      u64 enc = sfw_session_encode (
 		thread_index, s - sm->sessions[thread_index]);
@@ -659,6 +679,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      dk->src_port = m->src_port;
 	      dk->dst_port = m->dst_port;
 	      dk->protocol = m->protocol;
+	      dk->table_id = m->rx_fib_index;
 	      kv2.value = enc;
 
 	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
@@ -681,6 +702,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      gkey->src_port = m->dst_port;
 	      gkey->dst_port = m->src_port;
 	      gkey->protocol = m->protocol;
+	      gkey->table_id = m->rx_fib_index;
 	      if (clib_bihash_search_48_8 (&sm->session_hash, &gk, &gr) == 0)
 		{
 		  u32 gt = sfw_session_thread (gr.value);
@@ -752,6 +774,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 			  ckey->src_port = m->dst_port;
 			  ckey->dst_port = clib_host_to_net_u16 (try_port);
 			  ckey->protocol = m->protocol;
+			  ckey->table_id = m->rx_fib_index;
 			  if (clib_bihash_search_48_8 (&sm->session_hash,
 						       &ck, &cr) != 0)
 			    {
@@ -786,6 +809,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  s->k4.src_port = m->dst_port;
 		  s->k4.dst_port = m->src_port;
 		  s->k4.protocol = m->protocol;
+		  s->k4.table_id = m->rx_fib_index;
 		  s->xlate.v4.nat_addr = m->nat_addr;
 		  s->xlate.v4.nat_port = m->nat_port;
 		  s->xlate.v4.orig_addr = ip0->src_address;
@@ -807,6 +831,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  nk->src_port = m->dst_port;
 		  nk->dst_port = m->nat_port;
 		  nk->protocol = m->protocol;
+		  nk->table_id = m->rx_fib_index;
 		  kv2.value = enc;
 
 		  if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
@@ -831,6 +856,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  s->k4.src_port = m->src_port;
 		  s->k4.dst_port = m->nat_port;
 		  s->k4.protocol = m->protocol;
+		  s->k4.table_id = m->rx_fib_index;
 		  s->xlate.v4.nat_addr = ip0->dst_address;
 		  s->xlate.v4.nat_port = m->dst_port;
 		  s->xlate.v4.orig_addr = m->nat_addr;
@@ -851,6 +877,7 @@ sfw_ip4_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  nk->src_port = m->src_port;
 		  nk->dst_port = m->dst_port;
 		  nk->protocol = m->protocol;
+		  nk->table_id = m->rx_fib_index;
 		  kv2.value = enc;
 
 		  if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
@@ -943,6 +970,7 @@ typedef struct
   u8 nat64_forward;		 /* 1 = new v6->v4 flow, translate in pass 2 */
   u8 nat64_return;		 /* 1 = matched NAT64 session, translate
 				      (rare on v6 input; kept for symmetry) */
+  u32 rx_fib_index;		 /* ingress VRF — every v6 key uses it */
 } sfw_pkt_meta6_t;
 
 always_inline uword
@@ -983,6 +1011,12 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       ip6_header_t *ip0 = vlib_buffer_get_current (bufs[i]);
       u32 sw_if_index0 = vnet_buffer (bufs[i])->sw_if_index[VLIB_RX];
+      /* Ingress VRF — every v6 session key in this scope carries it. */
+      u32 rx_fib_index =
+	(sw_if_index0 < vec_len (ip6_main.fib_index_by_sw_if_index)) ?
+	  vec_elt (ip6_main.fib_index_by_sw_if_index, sw_if_index0) :
+	  0;
+      m->rx_fib_index = rx_fib_index;
 
       /* Pass link-local traffic without policy evaluation. */
       if (PREDICT_FALSE (ip6_address_is_link_local_unicast (&ip0->src_address)
@@ -1023,6 +1057,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       key->src_port = m->dst_port;
       key->dst_port = m->src_port;
       key->protocol = m->protocol;
+      key->table_id = m->rx_fib_index;
 
       if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
 	found_session = 1;
@@ -1037,6 +1072,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  key->src_port = m->src_port;
 	  key->dst_port = m->dst_port;
 	  key->protocol = m->protocol;
+	  key->table_id = m->rx_fib_index;
 
 	  if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
 	    found_session = 1;
@@ -1104,11 +1140,12 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       u32 dst_zone =
 	sfw_resolve_dst_zone6 (sm, sw_if_index0, &ip0->dst_address);
 
-      sfw_policy_t *policy = sfw_zone_pair_policy (sm, src_zone, dst_zone);
+      sfw_policy_t *policy =
+	sfw_zone_pair_policy (sm, rx_fib_index, src_zone, dst_zone);
       u8 is_from_zone = 1;
       if (!policy)
 	{
-	  policy = sfw_zone_pair_policy (sm, dst_zone, src_zone);
+	  policy = sfw_zone_pair_policy (sm, rx_fib_index, dst_zone, src_zone);
 	  if (policy)
 	    is_from_zone = 0;
 	}
@@ -1128,7 +1165,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
        * routable, and produced no reply. */
       if (m->protocol == IP_PROTOCOL_ICMP6 && policy->implicit_icmpv6 &&
 	  sfw_is_implicit_icmpv6 (m->icmp_type) &&
-	  sfw_nat64_match_pool (sm, &ip0->dst_address) == ~0u)
+	  sfw_nat64_match_pool (sm, rx_fib_index, &ip0->dst_address) == ~0u)
 	{
 	  permitted++;
 	  continue;
@@ -1169,7 +1206,8 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      continue;
 	    }
 
-	  u32 pool_idx = sfw_nat64_match_pool (sm, &ip0->dst_address);
+	  u32 pool_idx =
+	    sfw_nat64_match_pool (sm, rx_fib_index, &ip0->dst_address);
 	  if (pool_idx == ~0u)
 	    {
 	      m->action = SFW_ACTION_PERMIT_STATEFUL;
@@ -1280,6 +1318,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      s->k6.src_port = m->dst_port;
 	      s->k6.dst_port = m->src_port;
 	      s->k6.protocol = m->protocol;
+	      s->k6.table_id = m->rx_fib_index;
 	      /* xlate.n64: v4 side state */
 	      s->xlate.n64.v4_pool = m->nat64_v4_pool;
 	      s->xlate.n64.v4_server = m->nat64_v4_server;
@@ -1321,6 +1360,9 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  nk->dst_port = m->nat64_v4_pool_port;
 		  nk->protocol = m->protocol;
 		}
+	      /* NAT64 v4 return key — same VRF as v6 ingress for now;
+	       * cross-VRF NAT64 is out of scope (see project plan). */
+	      nk->table_id = m->rx_fib_index;
 	      kv2.value = enc;
 
 	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
@@ -1392,6 +1434,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      s->k6.src_port = m->dst_port;
 	      s->k6.dst_port = m->src_port;
 	      s->k6.protocol = m->protocol;
+	      s->k6.table_id = m->rx_fib_index;
 
 	      u64 enc = sfw_session_encode (
 		thread_index, s - sm->sessions[thread_index]);
@@ -1408,6 +1451,7 @@ sfw_ip6_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      dk->src_port = m->src_port;
 	      dk->dst_port = m->dst_port;
 	      dk->protocol = m->protocol;
+	      dk->table_id = m->rx_fib_index;
 	      kv2.value = enc;
 
 	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
@@ -1488,6 +1532,7 @@ typedef struct
   u8 icmp_type;
   u8 icmp_code;
   u8 is_local_src;
+  u32 tx_fib_index; /* egress VRF — keys built in pass 1 + pass 2 */
 } sfw_out_meta_t;
 
 always_inline uword
@@ -1529,6 +1574,12 @@ sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       ip4_header_t *ip0 =
 	(ip4_header_t *) ((u8 *) vlib_buffer_get_current (bufs[i]) + rw_len);
       u32 tx_sw_if_index = vnet_buffer (bufs[i])->sw_if_index[VLIB_TX];
+      /* Egress VRF — keys built in pass 1 + pass 2 carry it. */
+      u32 tx_fib_index =
+	(tx_sw_if_index < vec_len (ip4_main.fib_index_by_sw_if_index)) ?
+	  vec_elt (ip4_main.fib_index_by_sw_if_index, tx_sw_if_index) :
+	  0;
+      m->tx_fib_index = tx_fib_index;
 
       u32 dst_h = clib_net_to_host_u32 (ip0->dst_address.as_u32);
       u32 src_h = clib_net_to_host_u32 (ip0->src_address.as_u32);
@@ -1568,6 +1619,7 @@ sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       key->src_port = m->dst_port;
       key->dst_port = m->src_port;
       key->protocol = m->protocol;
+      key->table_id = tx_fib_index;
 
       if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
 	{
@@ -1583,6 +1635,7 @@ sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  key->src_port = m->src_port;
 	  key->dst_port = m->dst_port;
 	  key->protocol = m->protocol;
+	  key->table_id = tx_fib_index;
 	  if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
 	    {
 	      found_session = 1;
@@ -1647,7 +1700,7 @@ sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	continue;
 
       sfw_policy_t *policy =
-	sfw_zone_pair_policy (sm, SFW_ZONE_LOCAL, dst_zone);
+	sfw_zone_pair_policy (sm, tx_fib_index, SFW_ZONE_LOCAL, dst_zone);
       if (PREDICT_FALSE (!policy))
 	continue;
 
@@ -1694,6 +1747,7 @@ sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  gkey->src_port = m->dst_port;
 	  gkey->dst_port = m->src_port;
 	  gkey->protocol = m->protocol;
+	  gkey->table_id = m->tx_fib_index;
 	  if (clib_bihash_search_48_8 (&sm->session_hash, &gk, &gr) == 0)
 	    {
 	      hits++;
@@ -1711,6 +1765,7 @@ sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      s->k4.src_port = m->dst_port;
 	      s->k4.dst_port = m->src_port;
 	      s->k4.protocol = m->protocol;
+	      s->k4.table_id = m->tx_fib_index;
 
 	      u64 enc = sfw_session_encode (
 		thread_index, s - sm->sessions[thread_index]);
@@ -1727,6 +1782,7 @@ sfw_ip4_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      dk->src_port = m->src_port;
 	      dk->dst_port = m->dst_port;
 	      dk->protocol = m->protocol;
+	      dk->table_id = m->tx_fib_index;
 	      kv2.value = enc;
 
 	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)
@@ -1816,6 +1872,12 @@ sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       ip6_header_t *ip0 =
 	(ip6_header_t *) ((u8 *) vlib_buffer_get_current (bufs[i]) + rw_len);
       u32 tx_sw_if_index = vnet_buffer (bufs[i])->sw_if_index[VLIB_TX];
+      /* Egress VRF — keys built in pass 1 + pass 2 carry it. */
+      u32 tx_fib_index =
+	(tx_sw_if_index < vec_len (ip6_main.fib_index_by_sw_if_index)) ?
+	  vec_elt (ip6_main.fib_index_by_sw_if_index, tx_sw_if_index) :
+	  0;
+      m->tx_fib_index = tx_fib_index;
 
       if (PREDICT_FALSE (
 	    ip6_address_is_link_local_unicast (&ip0->src_address) ||
@@ -1851,6 +1913,7 @@ sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       key->src_port = m->dst_port;
       key->dst_port = m->src_port;
       key->protocol = m->protocol;
+      key->table_id = m->tx_fib_index;
 
       if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
 	{
@@ -1866,6 +1929,7 @@ sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  key->src_port = m->src_port;
 	  key->dst_port = m->dst_port;
 	  key->protocol = m->protocol;
+	  key->table_id = m->tx_fib_index;
 	  if (clib_bihash_search_48_8 (&sm->session_hash, &kv, &result) == 0)
 	    {
 	      found_session = 1;
@@ -1925,7 +1989,7 @@ sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	continue;
 
       sfw_policy_t *policy =
-	sfw_zone_pair_policy (sm, SFW_ZONE_LOCAL, dst_zone);
+	sfw_zone_pair_policy (sm, tx_fib_index, SFW_ZONE_LOCAL, dst_zone);
       if (PREDICT_FALSE (!policy))
 	continue;
 
@@ -1977,6 +2041,7 @@ sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  gkey->src_port = m->dst_port;
 	  gkey->dst_port = m->src_port;
 	  gkey->protocol = m->protocol;
+	  gkey->table_id = m->tx_fib_index;
 	  if (clib_bihash_search_48_8 (&sm->session_hash, &gk, &gr) == 0)
 	    {
 	      hits++;
@@ -1994,6 +2059,7 @@ sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      s->k6.src_port = m->dst_port;
 	      s->k6.dst_port = m->src_port;
 	      s->k6.protocol = m->protocol;
+	      s->k6.table_id = m->tx_fib_index;
 
 	      u64 enc = sfw_session_encode (
 		thread_index, s - sm->sessions[thread_index]);
@@ -2010,6 +2076,7 @@ sfw_ip6_output_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      dk->src_port = m->src_port;
 	      dk->dst_port = m->dst_port;
 	      dk->protocol = m->protocol;
+	      dk->table_id = m->tx_fib_index;
 	      kv2.value = enc;
 
 	      if (sfw_session_insert_hash (sm, s, enc, &kv1, &kv2) == 0)

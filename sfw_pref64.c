@@ -16,6 +16,7 @@
 #include <sfw/sfw.h>
 #include <vlib/vlib.h>
 #include <vnet/vnet.h>
+#include <vnet/ip/ip6.h>
 #include <vnet/ip/ip6_packet.h>
 #include <vnet/ip6-nd/ip6_ra.h>
 
@@ -124,10 +125,15 @@ sfw_pref64_enable (sfw_main_t *sm, u32 sw_if_index,
 		   const ip6_address_t *prefix, u8 prefix_len,
 		   u16 lifetime_sec)
 {
-  /* Prefix must correspond to an existing NAT64 pool; advertising a
-   * PREF64 we don't actually translate is worse than not advertising
-   * at all (clients would send traffic into a black hole). */
-  u32 pool_idx = sfw_nat64_match_pool (sm, prefix);
+  /* Prefix must correspond to an existing NAT64 pool in this
+   * interface's VRF; advertising a PREF64 we don't actually translate
+   * is worse than not advertising at all (clients would send traffic
+   * into a black hole). */
+  u32 fib_index =
+    (sw_if_index < vec_len (ip6_main.fib_index_by_sw_if_index)) ?
+      vec_elt (ip6_main.fib_index_by_sw_if_index, sw_if_index) :
+      0;
+  u32 pool_idx = sfw_nat64_match_pool (sm, fib_index, prefix);
   if (pool_idx == ~0u)
     return -1;
 

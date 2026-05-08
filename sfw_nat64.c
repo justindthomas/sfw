@@ -131,13 +131,17 @@ sfw_nat64_extract_v4 (const ip6_address_t *prefix, u8 prefix_len,
 }
 
 u32
-sfw_nat64_match_pool (sfw_main_t *sm, const ip6_address_t *v6_dst)
+sfw_nat64_match_pool (sfw_main_t *sm, u32 table_id,
+		      const ip6_address_t *v6_dst)
 {
   u32 i;
   for (i = 0; i < vec_len (sm->nat_pools); i++)
     {
       sfw_nat_pool_t *p = &sm->nat_pools[i];
       if (p->kind != SFW_POOL_KIND_NAT64)
+	continue;
+      /* VRF guard: pool serves only its configured ingress VRF. */
+      if (p->table_id != table_id)
 	continue;
 
       u8 pfx_bytes = p->nat64_prefix_len / 8;

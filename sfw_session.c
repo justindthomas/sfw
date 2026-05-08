@@ -94,6 +94,7 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
 	  dk->src_port = s->k6.dst_port;
 	  dk->dst_port = s->k6.src_port;
 	  dk->protocol = s->k6.protocol;
+	  dk->table_id = s->k6.table_id;
 	}
       else
 	{
@@ -103,6 +104,7 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
 	  dk->src_port = s->k4.dst_port;
 	  dk->dst_port = s->k4.src_port;
 	  dk->protocol = s->k4.protocol;
+	  dk->table_id = s->k4.table_id;
 	}
       rv = clib_bihash_add_del_48_8 (&sm->session_hash, &kv, 0 /* is_add */);
       if (PREDICT_FALSE (rv != 0))
@@ -117,6 +119,7 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
       nk->src_port = s->k4.src_port;
       nk->dst_port = s->xlate.v4.nat_port;
       nk->protocol = s->k4.protocol;
+      nk->table_id = s->k4.table_id;
       rv = clib_bihash_add_del_48_8 (&sm->session_hash, &kv, 0 /* is_add */);
       if (PREDICT_FALSE (rv != 0))
 	clib_warning ("sfw: NAT hash delete failed (rv=%d)", rv);
@@ -130,6 +133,7 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
       nk->src_port = s->xlate.v4.nat_port;
       nk->dst_port = s->k4.dst_port;
       nk->protocol = s->k4.protocol;
+      nk->table_id = s->k4.table_id;
       rv = clib_bihash_add_del_48_8 (&sm->session_hash, &kv, 0 /* is_add */);
       if (PREDICT_FALSE (rv != 0))
 	clib_warning ("sfw: DNAT hash delete failed (rv=%d)", rv);
@@ -160,6 +164,8 @@ sfw_session_unhash (sfw_main_t *sm, sfw_session_t *s)
 	  nk->dst_port = s->xlate.n64.v4_pool_port;
 	  nk->protocol = s->k6.protocol;
 	}
+      /* NAT64 v4 return — same VRF as v6 ingress (k6.table_id) */
+      nk->table_id = s->k6.table_id;
       rv = clib_bihash_add_del_48_8 (&sm->session_hash, &kv, 0 /* is_add */);
       if (PREDICT_FALSE (rv != 0))
 	clib_warning ("sfw: NAT64 v4-return hash delete failed (rv=%d)", rv);

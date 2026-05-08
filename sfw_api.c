@@ -97,11 +97,11 @@ vl_api_sfw_zone_interface_add_del_t_handler (
       sm->if_config[sw_if_index].zone_id = zone_id;
 
       /* Enable the feature arc on this interface if any policy
-       * already references its zone. */
+       * (in any VRF) references its zone. */
       u32 i;
-      for (i = 0; i < SFW_MAX_ZONES * SFW_MAX_ZONES; i++)
+      for (i = 0; i < vec_len (sm->policies); i++)
 	{
-	  sfw_policy_t *p = sm->zone_pairs[i].policy;
+	  sfw_policy_t *p = sm->policies[i];
 	  if (p && (p->from_zone_id == zone_id || p->to_zone_id == zone_id))
 	    {
 	      sfw_enable_disable_interface (sm, sw_if_index, 1);
@@ -167,7 +167,9 @@ vl_api_sfw_policy_add_del_t_handler (vl_api_sfw_policy_add_del_t *mp)
 	  goto done;
 	}
 
-      sfw_policy_t *p = sfw_policy_create (sm, policy_name, from_id, to_id);
+      sfw_policy_t *p =
+	sfw_policy_create (sm, policy_name, from_id, to_id,
+			   ntohl (mp->table_id));
       if (!p)
 	{
 	  rv = VNET_API_ERROR_UNSPECIFIED;
@@ -320,6 +322,7 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 
   if (mp->is_add)
     {
+      u32 pool_table_id = ntohl (mp->table_id);
       /* Idempotent add — same semantic as the CLI path. impd's
        * boot-apply fires `sfw_nat_pool_add_del is_add=1` every
        * start, so the handler must handle repeated identical
@@ -333,7 +336,8 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 	  if (p->external_addr.as_u32 == ext_addr.as_u32 &&
 	      p->external_plen == ext_plen &&
 	      p->internal_addr.as_u32 == int_addr.as_u32 &&
-	      p->internal_plen == int_plen)
+	      p->internal_plen == int_plen &&
+	      p->table_id == pool_table_id)
 	    {
 	      if (p->mode != mp->mode)
 		{
@@ -353,6 +357,7 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
       pool.internal_addr = int_addr;
       pool.internal_plen = int_plen;
       pool.mode = mp->mode;
+      pool.table_id = pool_table_id;
       pool.port_range_start = 1024;
       pool.port_range_end = 65535;
       pool.n_external_addrs =
@@ -381,11 +386,10 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
     }
   else
     {
-      /* Find the pool whose (external_addr/plen, internal_addr/plen)
-       * matches exactly and remove it. Delete by walking and
-       * splicing rather than by index — callers don't know the
-       * internal pool index. */
+      /* Find the pool whose (external_addr/plen, internal_addr/plen,
+       * table_id) matches exactly and remove it. */
       u32 i;
+      u32 pool_table_id = ntohl (mp->table_id);
       int matched = 0;
       for (i = 0; i < vec_len (sm->nat_pools); i++)
 	{
@@ -393,7 +397,8 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 	  if (p->external_addr.as_u32 == ext_addr.as_u32 &&
 	      p->external_plen == ext_plen &&
 	      p->internal_addr.as_u32 == int_addr.as_u32 &&
-	      p->internal_plen == int_plen)
+	      p->internal_plen == int_plen &&
+	      p->table_id == pool_table_id)
 	    {
 	      sfw_nat_pool_free_internals (sm, p);
 	      vec_delete (sm->nat_pools, 1, i);
@@ -448,6 +453,7 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
   ip6_address_t v6_prefix = v6_fp.fp_addr.ip6;
   u8 v6_plen = v6_fp.fp_len;
 
+  u32 pool_table_id = ntohl (mp->table_id);
   if (mp->is_add)
     {
       /* Idempotent add — see the NAT44 path. */
@@ -460,6 +466,7 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
 	  if (p->external_addr.as_u32 == ext_addr.as_u32 &&
 	      p->external_plen == ext_plen &&
 	      p->nat64_prefix_len == v6_plen &&
+	      p->table_id == pool_table_id &&
 	      clib_memcmp (&p->nat64_prefix, &v6_prefix,
 			   sizeof (ip6_address_t)) == 0)
 	    goto done; /* identical pool already present */
@@ -473,6 +480,7 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
       pool.mode = SFW_NAT_MODE_DYNAMIC;
       ip6_address_copy (&pool.nat64_prefix, &v6_prefix);
       pool.nat64_prefix_len = v6_plen;
+      pool.table_id = pool_table_id;
       pool.port_range_start = 1024;
       pool.port_range_end = 65535;
       pool.n_external_addrs =
@@ -496,6 +504,7 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
 	    continue;
 	  if (p->external_addr.as_u32 == ext_addr.as_u32 &&
 	      p->external_plen == ext_plen && p->nat64_prefix_len == v6_plen &&
+	      p->table_id == pool_table_id &&
 	      clib_memcmp (&p->nat64_prefix, &v6_prefix,
 			   sizeof (ip6_address_t)) == 0)
 	    {
@@ -616,6 +625,7 @@ vl_api_sfw_nat_static_add_del_t_handler (
   u16 ext_port = ntohs (mp->external_port);
   u16 int_port = ntohs (mp->internal_port);
 
+  u32 static_table_id = ntohl (mp->table_id);
   if (mp->is_add)
     {
       sfw_nat_static_t mapping;
@@ -625,6 +635,7 @@ vl_api_sfw_nat_static_add_del_t_handler (
       mapping.internal_addr = int_addr;
       mapping.internal_port = int_port;
       mapping.protocol = mp->protocol;
+      mapping.table_id = static_table_id;
       vec_add1 (sm->nat_statics, mapping);
     }
   else
@@ -636,7 +647,8 @@ vl_api_sfw_nat_static_add_del_t_handler (
 	  sfw_nat_static_t *s = &sm->nat_statics[i];
 	  if (s->external_addr.as_u32 == ext_addr.as_u32 &&
 	      s->protocol == mp->protocol &&
-	      s->external_port == ext_port)
+	      s->external_port == ext_port &&
+	      s->table_id == static_table_id)
 	    {
 	      vec_delete (sm->nat_statics, 1, i);
 	      matched = 1;

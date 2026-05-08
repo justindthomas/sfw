@@ -17,7 +17,9 @@
 /* --- Session keys --- */
 
 /* IPv4 session key — zero-padded to 48 bytes for unified bihash_48_8.
- * Occupies first 16 bytes; remaining 32 bytes must be zero. */
+ * 5-tuple + ingress fib_index (table_id) so two VRFs with overlapping
+ * v4 ranges hash to distinct sessions. Occupies first 20 bytes; the
+ * remaining 28 bytes must be zero. */
 typedef struct
 {
   ip4_address_t src;
@@ -26,18 +28,20 @@ typedef struct
   u16 dst_port;
   u8 protocol;
   u8 pad[3];
+  u32 table_id;
 } sfw_key4_t;
 
-STATIC_ASSERT_SIZEOF (sfw_key4_t, 16);
+STATIC_ASSERT_SIZEOF (sfw_key4_t, 20);
 
-/* IPv6 session key — full 48 bytes */
+/* IPv6 session key — full 48 bytes including ingress fib_index. */
 typedef CLIB_PACKED (struct {
   ip6_address_t src;
   ip6_address_t dst;
   u16 src_port;
   u16 dst_port;
   u8 protocol;
-  u8 pad[11];
+  u8 pad[7];
+  u32 table_id;
 }) sfw_key6_t;
 
 STATIC_ASSERT_SIZEOF (sfw_key6_t, 48);
@@ -123,6 +127,12 @@ typedef struct
   u8 internal_plen;
   u8 mode; /* sfw_nat_mode_t — NAT64 pools are always dynamic */
 
+  /* Ingress VRF (rx_fib_index) this pool serves. Pool selection
+   * matches both prefix containment AND table_id == rx_fib_index, so
+   * two VRFs with overlapping internal ranges get separate pools.
+   * 0 means default VRF (preserves pre-VRF behaviour). */
+  u32 table_id;
+
   /* NAT64 only: RFC 6052 prefix for address embedding (valid when
    * kind == SFW_POOL_KIND_NAT64). nat64_prefix_len must be one of
    * {32, 40, 48, 56, 64, 96}. */
@@ -151,6 +161,7 @@ typedef struct
   ip4_address_t internal_addr;
   u16 internal_port;
   u8 protocol; /* TCP/UDP */
+  u32 table_id; /* ingress VRF this static serves; 0 = default */
 } sfw_nat_static_t;
 
 /* --- Sessions --- */
@@ -257,6 +268,7 @@ typedef struct
   char name[64];
   u32 from_zone_id; /* zone where traffic originates */
   u32 to_zone_id;   /* zone where traffic is destined */
+  u32 table_id;	    /* ingress VRF this policy applies in; 0 = default */
 } sfw_policy_t;
 
 /* --- Zones --- */
@@ -277,6 +289,17 @@ typedef struct
 {
   sfw_policy_t *policy; /* policy for this zone-pair, or NULL */
 } sfw_zone_pair_t;
+
+/* Per-VRF zone-pair slab. zone_pairs is a [MAX_ZONES * MAX_ZONES]
+ * array, lazily allocated when a policy with this table_id is
+ * created. Lookup is O(1): one vec deref to get the slab pointer,
+ * one array index inside it. NULL slab means "no policy in this
+ * VRF" — hot path early-exits. */
+typedef struct
+{
+  sfw_zone_pair_t *zone_pairs; /* vec [MAX_ZONES * MAX_ZONES], or 0 */
+  u32 n_policies;	       /* refcount; slab freed when 0 */
+} sfw_zone_pair_slab_t;
 
 /* Per-interface config, indexed by sw_if_index */
 typedef struct
@@ -332,8 +355,13 @@ typedef struct
   sfw_zone_t zones[SFW_MAX_ZONES];
   u32 n_zones; /* number of defined zones (next zone_id to assign) */
 
-  /* Zone-pair policy table: [from_zone_id * SFW_MAX_ZONES + to_zone_id] */
-  sfw_zone_pair_t zone_pairs[SFW_MAX_ZONES * SFW_MAX_ZONES];
+  /* Per-VRF zone-pair tables, vec indexed by table_id (fib_index).
+   * Slab at index i is allocated lazily when the first policy with
+   * table_id == i is created, and freed when the last is removed.
+   * Lookups in the packet path: vec_validate-style "i < vec_len"
+   * check, then deref the slab pointer. Both are NULL-safe — the
+   * common single-VRF case keeps everything at index 0. */
+  sfw_zone_pair_slab_t *zone_pairs_by_table;
 
   /* Policy pool */
   sfw_policy_t **policies; /* vec of policy pointers */
@@ -524,13 +552,42 @@ u32 sfw_zone_find_by_name (sfw_main_t *sm, const char *name);
 u32 sfw_zone_find_or_create (sfw_main_t *sm, const char *name);
 
 /* Policy helpers. sfw_policy_create wires the new policy into the
- * zone-pair table and enables the feature arc on every interface
- * that falls in from_zone or to_zone. sfw_policy_delete is the
- * inverse: detach from zone-pair, free rules + the policy struct. */
+ * per-VRF zone-pair table and enables the feature arc on every
+ * interface that falls in from_zone or to_zone. sfw_policy_delete is
+ * the inverse: detach from zone-pair, free rules + the policy
+ * struct. table_id selects which VRF's zone-pair slab to attach to;
+ * 0 means default. */
 sfw_policy_t *sfw_policy_find (sfw_main_t *sm, const char *name);
 sfw_policy_t *sfw_policy_create (sfw_main_t *sm, const char *name,
-				 u32 from_zone_id, u32 to_zone_id);
+				 u32 from_zone_id, u32 to_zone_id,
+				 u32 table_id);
 void sfw_policy_delete (sfw_main_t *sm, sfw_policy_t *p);
+
+/* Per-VRF zone-pair lookup. Returns NULL if no slab is allocated for
+ * this table_id (the common case for VRFs without any policy) or no
+ * policy is registered for this (from, to) pair. */
+sfw_policy_t *sfw_zone_pair_get (sfw_main_t *sm, u32 table_id,
+				 u32 from_zone_id, u32 to_zone_id);
+
+/* Set the policy at (table_id, from, to). Allocates the slab on
+ * demand. Caller is responsible for ensuring no existing policy
+ * occupies this slot. Returns 0 on success, -1 if zone ids out of
+ * range. */
+int sfw_zone_pair_set (sfw_main_t *sm, u32 table_id, u32 from_zone_id,
+		       u32 to_zone_id, sfw_policy_t *p);
+
+/* Clear (table_id, from, to). Frees the slab if its refcount drops
+ * to zero. */
+void sfw_zone_pair_clear (sfw_main_t *sm, u32 table_id, u32 from_zone_id,
+			  u32 to_zone_id);
+
+/* Iterate every (table_id, from, to, policy) tuple. cb returns 0 to
+ * continue, non-zero to break. */
+typedef int (*sfw_zone_pair_cb_t) (sfw_main_t *sm, u32 table_id,
+				   u32 from_zone_id, u32 to_zone_id,
+				   sfw_policy_t *p, void *opaque);
+void sfw_zone_pair_foreach (sfw_main_t *sm, sfw_zone_pair_cb_t cb,
+			    void *opaque);
 
 /* API message handlers hookup (see sfw_api.c). */
 clib_error_t *sfw_plugin_api_hookup (vlib_main_t *vm);
@@ -550,13 +607,14 @@ int sfw_session_insert_hash (sfw_main_t *sm, sfw_session_t *s, u64 enc,
 
 /* NAT */
 int sfw_nat_translate_source (sfw_main_t *sm, u32 thread_index,
-			      ip4_address_t *src_addr, u16 src_port,
-			      u8 protocol, ip4_address_t *dst_addr,
+			      u32 table_id, ip4_address_t *src_addr,
+			      u16 src_port, u8 protocol,
+			      ip4_address_t *dst_addr,
 			      ip4_address_t *out_addr, u16 *out_port,
 			      u8 *out_mode, u32 *out_alloc_idx);
-sfw_nat_static_t *sfw_nat_find_dnat (sfw_main_t *sm,
-				      ip4_address_t *dst_addr, u16 dst_port,
-				      u8 protocol);
+sfw_nat_static_t *sfw_nat_find_dnat (sfw_main_t *sm, u32 table_id,
+				     ip4_address_t *dst_addr, u16 dst_port,
+				     u8 protocol);
 u32 sfw_ip4_addr_index (ip4_address_t *addr, ip4_address_t *base, u8 plen);
 void sfw_ip4_addr_from_index (ip4_address_t *out, ip4_address_t *base,
 			      u8 plen, u32 index);
@@ -591,9 +649,11 @@ void sfw_nat64_embed_v4 (const ip6_address_t *prefix, u8 prefix_len,
 int sfw_nat64_extract_v4 (const ip6_address_t *prefix, u8 prefix_len,
 			  const ip6_address_t *v6, ip4_address_t *out_v4);
 
-/* Find a NAT64 pool whose prefix covers v6_dst. Returns pool index into
- * sm->nat_pools, or ~0 if no pool matches. */
-u32 sfw_nat64_match_pool (sfw_main_t *sm, const ip6_address_t *v6_dst);
+/* Find a NAT64 pool whose prefix covers v6_dst AND whose table_id
+ * matches rx_fib_index. Returns pool index into sm->nat_pools, or ~0
+ * if no pool matches. */
+u32 sfw_nat64_match_pool (sfw_main_t *sm, u32 table_id,
+			  const ip6_address_t *v6_dst);
 
 /* In-place translate the IPv6 packet at vlib_buffer_get_current(b) to
  * IPv4, using session->xlate.n64 fields for the translated addresses
