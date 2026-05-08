@@ -287,18 +287,40 @@ unformat_vnet_sw_interface (unformat_input_t *input, va_list *args)
 /*  v2.1: chassis fixture (driveable harness)                   */
 /* ============================================================ */
 
-/* One synthetic buffer slot.  vlib_get_buffers()-via-
+/* N synthetic buffer slots.  vlib_get_buffers()-via-
  * vlib_get_buffers_with_offset computes the buffer pointer as
- * `buffer_mem_start + (bi << CLIB_LOG2_CACHE_LINE_BYTES)`, so for
- * bi=0 the buffer sits at offset 0.  The slot must be cache-line
- * aligned (CLIB_CACHE_LINE_BYTES=64); a 64-byte alignment is
- * stricter than VPP's actual pool alignment but is sufficient. */
+ * `buffer_mem_start + (bi << CLIB_LOG2_CACHE_LINE_BYTES)`.  Each
+ * vlib_buffer_t is sizeof(vlib_buffer_t) + default_data_size = 256 +
+ * 2048 = 2304 bytes = 36 cache lines, so buffer index N corresponds
+ * to arena offset N*64; we space them 36 indices apart (0, 36, 72,
+ * 108) to avoid header overlap.  v2.4: bumped from 1 to 4 slots so
+ * frame->n_vectors=4 exercises the per-frame meta[] / nexts[]
+ * boundary handling — a regression-defence against frame-boundary
+ * bugs like v1's NAT64 trigger F12. */
 #define FUZZ_BUFFER_DATA_SIZE 2048
 #define FUZZ_BUFFER_SLOT_SIZE \
   (sizeof (vlib_buffer_t) + FUZZ_BUFFER_DATA_SIZE)
+#define FUZZ_N_BUFFERS 4
+#define FUZZ_BUFFER_SLOT_STRIDE_INDEX 36 /* cache lines per slot */
+#define FUZZ_BUFFER_SLOT_STRIDE_BYTES \
+  (FUZZ_BUFFER_SLOT_STRIDE_INDEX * 64)
 
-static u8 fuzz_buffer_storage[FUZZ_BUFFER_SLOT_SIZE]
+static u8 fuzz_buffer_storage[FUZZ_N_BUFFERS * FUZZ_BUFFER_SLOT_STRIDE_BYTES]
   __attribute__ ((aligned (64)));
+
+static const u32 fuzz_buffer_indices[FUZZ_N_BUFFERS] = {
+  0 * FUZZ_BUFFER_SLOT_STRIDE_INDEX,
+  1 * FUZZ_BUFFER_SLOT_STRIDE_INDEX,
+  2 * FUZZ_BUFFER_SLOT_STRIDE_INDEX,
+  3 * FUZZ_BUFFER_SLOT_STRIDE_INDEX,
+};
+
+static inline vlib_buffer_t *
+fuzz_buffer_at (u32 i)
+{
+  return (vlib_buffer_t *) (fuzz_buffer_storage +
+			    i * FUZZ_BUFFER_SLOT_STRIDE_BYTES);
+}
 
 /* The vlib_main_t the harness body passes to sfw_ip{4,6}_inline.
  * Distinct from the link-time `vlib_global_main` (vlib_global_main_t,
@@ -531,6 +553,24 @@ harness_setup_policy_fib_fixture (void)
    * pass 2 of sfw_ip4_inline.  IPv6 has no NAT so the IPv6 harness's
    * permit path is unaffected; the policy match is still exercised. */
   fuzz_default_policy.default_action = SFW_ACTION_PERMIT_STATEFUL_NAT;
+
+  /* --- v2.4 step 1: DNAT static --- */
+  /* One wildcard mapping: any TCP/UDP/ICMP packet whose v4
+   * destination is 203.0.113.99 gets DNAT'd to 10.0.0.5:80.  The
+   * external_port=0/protocol=0 wildcard means "match by external
+   * address only" — sfw_nat_find_dnat treats it as a 1:1 fallback
+   * after exact match misses.  This opens both the DNAT-pre-classify
+   * branch (sfw_node.c:519) and the PERMIT_STATEFUL_NAT-with-dnat
+   * session-create branch (sfw_node.c:858). */
+  sfw_nat_static_t dnat;
+  memset (&dnat, 0, sizeof (dnat));
+  dnat.external_addr.as_u32 = clib_host_to_net_u32 (0xCB007163); /* 203.0.113.99 */
+  dnat.external_port = 0;
+  dnat.internal_addr.as_u32 = clib_host_to_net_u32 (0x0A000005); /* 10.0.0.5 */
+  dnat.internal_port = 80;
+  dnat.protocol = 0;
+  dnat.table_id = 0;
+  vec_add1 (sfw_main.nat_statics, dnat);
 }
 
 void
@@ -590,7 +630,9 @@ harness_init_once (void)
   fuzz_node_runtime.flags = 0;
 
   /* 6. Frame.  vector_offset must be non-zero (asserted), and points
-   *    `(void*)f + vector_offset` at the u32 buffer-index array. */
+   *    `(void*)f + vector_offset` at the u32 buffer-index array.
+   *    v2.4: n_vectors = FUZZ_N_BUFFERS (=4), each entry indexes a
+   *    distinct slot in fuzz_buffer_storage. */
   vlib_frame_t *frame = (vlib_frame_t *) fuzz_frame_storage;
   memset (frame, 0, FUZZ_FRAME_STORAGE_SIZE);
   frame->vector_offset = sizeof (vlib_frame_t);
@@ -598,9 +640,10 @@ harness_init_once (void)
    * aligned but make it explicit). */
   if (frame->vector_offset & 3)
     frame->vector_offset = (frame->vector_offset + 3) & ~3u;
-  frame->n_vectors = 1;
+  frame->n_vectors = FUZZ_N_BUFFERS;
   u32 *vec_args = (u32 *) ((u8 *) frame + frame->vector_offset);
-  vec_args[0] = 0;
+  for (u32 i = 0; i < FUZZ_N_BUFFERS; i++)
+    vec_args[i] = fuzz_buffer_indices[i];
 
   /* 7. buffer_func_main.buffer_enqueue_to_next_fn.  Without this set,
    *    vlib_buffer_enqueue_to_next would dereference NULL. */
@@ -644,36 +687,71 @@ harness_init_once (void)
 void
 harness_load_packet (const uint8_t *data, size_t size)
 {
-  vlib_buffer_t *b = (vlib_buffer_t *) fuzz_buffer_storage;
-
+  /* v2.4: Slice the fuzzer's bytes across FUZZ_N_BUFFERS packets in
+   * one frame.  Sub-packet length is encoded in the first byte of
+   * each slice (capped to remaining bytes); when the encoded length
+   * would exceed the cap or run off the end, we copy what's left
+   * and leave subsequent buffers length-zero.  This gives the
+   * fuzzer control over per-buffer packet length within a frame
+   * while keeping a single LLVMFuzzerTestOneInput byte stream as
+   * input — no custom mutator needed.
+   *
+   * The "split" is intentionally simple: it hands each buffer a
+   * contiguous slice of fuzzer data so the IP/L4 parser sees four
+   * potentially-different packets per call.  This exercises the
+   * per-frame meta[] arrays' boundary handling (an n_vectors=1
+   * harness misses interactions between adjacent buffer slots in
+   * memory-layout-sensitive arrays). */
   size_t cap = FUZZ_BUFFER_DATA_SIZE;
-  size_t n = size > cap ? cap : size;
+  const u8 *p = data;
+  size_t remaining = size;
 
-  /* Zero the header (template fields + opaque/opaque2) and copy bytes
-   * into b->data[].  current_data=0 means b->data[0..n-1] is the
-   * packet content.  flags=0 keeps NEXT_PRESENT/TOTAL_LENGTH_VALID
-   * clear so vlib_buffer_length_in_chain() returns current_length
-   * directly. */
-  memset (b, 0, sizeof (*b));
-  if (n > 0)
-    memcpy (b->data, data, n);
-  b->current_data = 0;
-  b->current_length = (u16) n;
-  b->flags = 0;
-  b->ref_count = 1;
-  b->buffer_pool_index = 0;
-  b->error = 0;
-  b->current_config_index = 0;
+  for (u32 i = 0; i < FUZZ_N_BUFFERS; i++)
+    {
+      vlib_buffer_t *b = fuzz_buffer_at (i);
 
-  vnet_buffer_opaque_t *vb = vnet_buffer (b);
-  vb->sw_if_index[VLIB_RX] = 0;
-  vb->sw_if_index[VLIB_TX] = (u32) ~0;
-  vb->feature_arc_index = 0;
+      /* Length byte + payload.  If we're out of bytes, this buffer
+       * is length-zero — the inline body's `if (size == 0) continue`
+       * guard at fuzz_sfw_ip*_node.c only checks the harness's own
+       * input, so we have to handle empty buffers here ourselves
+       * via early bailout from the inline body's IHL/length check. */
+      size_t slice_len = 0;
+      if (remaining > 0)
+	{
+	  slice_len = (size_t) p[0];
+	  p++;
+	  remaining--;
+	  if (slice_len > remaining)
+	    slice_len = remaining;
+	  if (slice_len > cap)
+	    slice_len = cap;
+	}
+
+      memset (b, 0, sizeof (*b));
+      if (slice_len > 0)
+	memcpy (b->data, p, slice_len);
+      b->current_data = 0;
+      b->current_length = (u16) slice_len;
+      b->flags = 0;
+      b->ref_count = 1;
+      b->buffer_pool_index = 0;
+      b->error = 0;
+      b->current_config_index = 0;
+
+      vnet_buffer_opaque_t *vb = vnet_buffer (b);
+      vb->sw_if_index[VLIB_RX] = 0;
+      vb->sw_if_index[VLIB_TX] = (u32) ~0;
+      vb->feature_arc_index = 0;
+
+      p += slice_len;
+      remaining -= slice_len;
+    }
 
   vlib_frame_t *frame = (vlib_frame_t *) fuzz_frame_storage;
-  frame->n_vectors = 1;
+  frame->n_vectors = FUZZ_N_BUFFERS;
   frame->frame_flags = 0;
   frame->flags = 0;
   u32 *vec_args = (u32 *) ((u8 *) frame + frame->vector_offset);
-  vec_args[0] = 0;
+  for (u32 i = 0; i < FUZZ_N_BUFFERS; i++)
+    vec_args[i] = fuzz_buffer_indices[i];
 }

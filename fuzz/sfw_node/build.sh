@@ -15,11 +15,11 @@
 #   runtime data + functions sfw .c files reach for outside
 #   libvppinfra.
 #
-# v2.3 scope (this script): v2.2 fixture + one NAT44 dynamic pool
-# (203.0.113.0/24 external) wired through sfw_v4_port_alloc_ref_or_
-# create, default policy action flipped to PERMIT_STATEFUL_NAT so
-# sfw_nat_translate_source fires per packet.  Coverage uplift
-# v2.2->v2.3: ip4 445->495, ip6 455->485.
+# v2.4 scope (this script): v2.3 fixture + one wildcard DNAT static
+# (203.0.113.99 -> 10.0.0.5:80) and frame->n_vectors bumped from 1
+# to 4 (per-frame meta[]/nexts[] interactions, sliced via a 1-byte
+# length prefix per buffer).  Coverage uplift v2.3->v2.4:
+# ip4 cov 495->569 / ft 496->1467, ip6 cov 485->499 / ft 486->1245.
 #
 # Usage:  build.sh [output-dir]
 #         (default output-dir: /src/fuzz/sfw_node/out)
