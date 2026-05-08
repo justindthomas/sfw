@@ -15,12 +15,11 @@
 #   runtime data + functions sfw .c files reach for outside
 #   libvppinfra.
 #
-# v2.2 scope (this script): same v2.1 chassis plus the policy + FIB
-# fixture (sm->if_config[0]=zone 2, zone-pair 2->1 with permit-
-# stateful policy, ip4_fib_16s + ip4_mtrie + load_balance_pool +
-# ip6_fib_fwding_table.ip6_hash all minimally populated so
-# sfw_resolve_dst_zone{4,6} returns SFW_ZONE_LOCAL).  Coverage
-# uplift v2.1->v2.2: ip4 342->445, ip6 310->455.
+# v2.3 scope (this script): v2.2 fixture + one NAT44 dynamic pool
+# (203.0.113.0/24 external) wired through sfw_v4_port_alloc_ref_or_
+# create, default policy action flipped to PERMIT_STATEFUL_NAT so
+# sfw_nat_translate_source fires per packet.  Coverage uplift
+# v2.2->v2.3: ip4 445->495, ip6 455->485.
 #
 # Usage:  build.sh [output-dir]
 #         (default output-dir: /src/fuzz/sfw_node/out)

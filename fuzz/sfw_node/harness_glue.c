@@ -495,6 +495,42 @@ harness_setup_policy_fib_fixture (void)
   kv6.value = 0;		    /* LB index 0 */
   clib_bihash_add_del_24_8 (&ip6_fib_fwding_table.ip6_hash, &kv6,
 			    1 /* add */);
+
+  /* --- v2.3: NAT44 pool + permit-stateful-nat policy --- */
+  /* Mirror sfw_nat_pool_add's hand-fill (sfw.c:1008-1041) but skip
+   * the CLI/idempotency wrapper and the sfw_feature_init re-call:
+   *   internal:  0.0.0.0/0  (any v4 source qualifies)
+   *   external:  203.0.113.0/24 (TEST-NET-3, RFC 5737 — guaranteed
+   *              non-routable, won't collide with anything real)
+   *   mode:      SFW_NAT_MODE_DYNAMIC (uses port allocator)
+   * sfw_v4_port_alloc_ref_or_create vec_validates the per-thread
+   * bitmap state keyed off vlib_num_workers()=0, matching v2.1's
+   * single-thread harness. */
+  sfw_nat_pool_t pool;
+  memset (&pool, 0, sizeof (pool));
+  pool.kind = SFW_POOL_KIND_NAT44;
+  pool.external_addr.as_u32 = clib_host_to_net_u32 (0xCB007100); /* 203.0.113.0 */
+  pool.external_plen = 24;
+  pool.internal_addr.as_u32 = 0;
+  pool.internal_plen = 0;
+  pool.mode = SFW_NAT_MODE_DYNAMIC;
+  pool.port_range_start = 1024;
+  pool.port_range_end = 65535;
+  pool.n_external_addrs = 256;	  /* /24 */
+  pool.n_internal_addrs = 1u << 31; /* /0 — large but OK, only used by det mode */
+  pool.ports_per_host = 64;	  /* unused for dynamic mode */
+  pool.table_id = 0;
+  pool.v4_alloc_idx = sfw_v4_port_alloc_ref_or_create (
+    &sfw_main, &pool.external_addr, pool.external_plen,
+    pool.port_range_start, pool.port_range_end);
+  vec_add1 (sfw_main.nat_pools, pool);
+
+  /* Flip the default-action so sfw_match_rules returns
+   * SFW_ACTION_PERMIT_STATEFUL_NAT — that's the trigger for
+   * sfw_nat_translate_source + the SNAT session-create branch in
+   * pass 2 of sfw_ip4_inline.  IPv6 has no NAT so the IPv6 harness's
+   * permit path is unaffected; the policy match is still exercised. */
+  fuzz_default_policy.default_action = SFW_ACTION_PERMIT_STATEFUL_NAT;
 }
 
 void

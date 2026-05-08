@@ -9,23 +9,23 @@ forward / NAT64 return), and the per-thread LRU bookkeeping.
 
 ## Status
 
-**v2.2: driveable + classifier-reaching — policy match,
-session-create, FIB lookup all wired.**
+**v2.3: full classify + stateful-NAT path covered.**
 
 The full sfw plugin (sfw.c, sfw_node.c, sfw_session.c, sfw_rules.c,
 sfw_nat.c, sfw_nat64.c) compiles with `-fsanitize=address,undefined,
 fuzzer-no-link`, the `bihash_{48,24}_8` templates instantiate
 standalone, and the chassis (`harness_glue.c` + `harness_init.h`)
 brings up enough VPP runtime to drive `sfw_ip{4,6}_inline` against
-fuzzer-supplied bytes. v2.2 adds the policy + FIB fixture so the
-per-packet loop reaches the classify / session-create / NAT /
-session-insert path on every iteration whose IP+L4 parse succeeds.
+fuzzer-supplied bytes through every classify branch. v2.3 adds a
+NAT44 dynamic pool + flips the default action to
+`PERMIT_STATEFUL_NAT`, so `sfw_nat_translate_source` and the SNAT
+session-insert branch fire on every parse-success packet.
 
 ```
-$ ./out/fuzz_sfw_ip4_node -max_total_time=8
-#2020164  DONE  cov: 445 ft: 446  exec/s: 224462
-$ ./out/fuzz_sfw_ip6_node -max_total_time=8
-#2040020  DONE  cov: 455 ft: 456  exec/s: 226668
+$ ./out/fuzz_sfw_ip4_node -max_total_time=10
+#2427744  DONE  cov: 495 ft: 496  exec/s: 220704
+$ ./out/fuzz_sfw_ip6_node -max_total_time=10
+#2398921  DONE  cov: 485 ft: 486  exec/s: 218083
 ```
 
 Coverage progression across versions:
@@ -35,6 +35,7 @@ Coverage progression across versions:
 | v2.0    |        1 |        1 | placeholder (entry/exit only) |
 | v2.1    |      342 |      310 | parse + L4-extract + bihash search |
 | v2.2    |      445 |      455 | + policy match + session create + FIB lookup |
+| v2.3    |      495 |      485 | + SNAT translate (sfw_nat_translate_source, port allocator) |
 
 ## Layout
 
@@ -85,8 +86,12 @@ entrypoints with the same signatures so the linker resolves cleanly.
 | Action dispatch (permit/deny/NAT)     | no                  | no                       | **yes (v2.2)**           |
 | FIB lookup (mtrie / bihash24_8)       | no                  | no                       | **yes (v2.2)**           |
 | Bihash session insert                 | no                  | no                       | **yes (v2.2)**           |
-| Stateful NAT path (SNAT / DNAT)       | no                  | no                       | v2.3+ (needs nat_pools)  |
-| LRU bookkeeping (multi-iter)          | no                  | no                       | v2.3+ (stateful fuzzer)  |
+| Stateful NAT path (SNAT translate)    | no                  | no                       | **yes (v2.3)**           |
+| Port allocator (per-thread bitmap)    | no                  | no                       | **yes (v2.3)**           |
+| DNAT static lookup                    | no                  | no                       | v2.4+ (needs DNAT statics) |
+| Deterministic-NAT slot scan           | no                  | no                       | v2.4+ (det pool)         |
+| LRU bookkeeping (multi-iter)          | no                  | no                       | v2.4+ (stateful fuzzer)  |
+| Multi-buffer per frame (n_vectors > 1) | no                 | no                       | v2.4+                    |
 | `sfw_api.c` handler mutators          | partial (one fn)    | no                       | **see `../sfw_api/` (Tier 2 #5)** |
 
 ## Architecture
@@ -144,36 +149,40 @@ then links each harness against:
          - **Both**: `pool_get_zero(load_balance_pool)` for LB index
            0 with `lb_n_buckets=1` and the inline bucket's
            `dpoi_type = DPO_RECEIVE`.
+    5. **v2.3 NAT pool**: hand-fills one NAT44 dynamic pool covering
+       internal `0.0.0.0/0` → external `203.0.113.0/24`, registers
+       the shared `sfw_v4_port_alloc_t` via
+       `sfw_v4_port_alloc_ref_or_create`, and flips the default
+       policy action to `SFW_ACTION_PERMIT_STATEFUL_NAT` so
+       `sfw_nat_translate_source` fires on every classify-match.
 - `libvppinfra` — same as v1.
 
-## Roadmap to v2.3
+## Roadmap to v2.4
 
-What v2.2 does **not** yet do: cover the stateful-NAT branches
-(`SFW_ACTION_PERMIT_STATEFUL_NAT`), deterministic-NAT slot scan, and
-the cross-frame LRU update path. The default policy is plain
-`permit-stateful` so `sfw_nat_translate_source` is never invoked.
-To open that coverage:
+v2.3 covers SNAT translation but leaves three branches dark:
 
-1. **Add one NAT pool.** `vec_add1(sm->nat_pools, ...)` with a
-   dynamic pool that maps any internal address to a single external
-   address + port range, plus the per-thread allocator state
-   (`sm->v4_port_allocs[0]`).  Then change the default-policy action
-   to `SFW_ACTION_PERMIT_STATEFUL_NAT` so the SNAT translation
-   pre-compute fires on every flow.
+1. **DNAT static lookup.** `sfw_nat_find_dnat` is unreached because
+   `sm->nat_static_dnat_v4` is empty.  Hand-fill one DNAT static
+   (e.g. external 203.0.113.10:80 → internal 10.0.0.5:8080) so the
+   pre-classify DNAT path + the
+   `SFW_ACTION_PERMIT_STATEFUL_NAT`-with-`dnat`-set branch lights
+   up.
 
-2. **Multi-iteration / stateful fuzzer.** libfuzzer's single-shot
-   model means each iteration starts with sm->session_hash empty
-   (well — populated only by previous iterations until evicted).
-   The LRU-touch path activates when an iteration's bihash search
-   returns an existing session.  Either drive it with a
-   structure-aware mutator that emits a sequence of related packets,
-   or accept the cumulative-state nature and let the corpus shape
-   itself over time.
+2. **Deterministic-NAT slot scan.** Add a second pool with
+   `mode=SFW_NAT_MODE_DETERMINISTIC` so `sfw_nat_translate_source`
+   takes the deterministic mod-port path; combined with corpus
+   evolution that produces colliding source ports, the
+   `det collision check` slot scan in `sfw_node.c` lights up.
 
-3. **Frame-of-N harness.** Currently `frame->n_vectors = 1`.
-   Bumping to 4-8 buffers per call would exercise the per-frame
-   `nexts[i]` and meta[] arrays' boundary handling — useful since
-   v1's NAT64 trigger F12 was a frame-boundary bug.
+3. **Multi-iteration / multi-vector frame.** libfuzzer's single-
+   shot model means each iteration's bihash starts in the state the
+   previous iteration left it; LRU-touch activates only when a
+   later iteration matches an earlier session.  Bumping
+   `frame->n_vectors` from 1 to 4-8 (with the same bytes copied
+   into N buffers, or fuzzer-controlled per-buffer slicing) would
+   exercise per-frame boundary handling.  v1's NAT64 trigger F12
+   was a frame-boundary bug — ensuring v2 has frame-boundary
+   coverage is a regression-defence priority.
 
 ## Findings to date
 
