@@ -976,6 +976,13 @@ sfw_nat_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (internal_plen > 32)
     return clib_error_return (0, "internal prefix length %u > 32",
 			      internal_plen);
+  /* F1(api) parity — see SFW_NAT_MIN_EXTERNAL_PLEN in sfw.h. */
+  if (external_plen < SFW_NAT_MIN_EXTERNAL_PLEN)
+    return clib_error_return (
+      0, "external prefix length %u < %u (would size port allocator > 64K)",
+      external_plen, SFW_NAT_MIN_EXTERNAL_PLEN);
+  if (internal_plen < 1)
+    return clib_error_return (0, "internal prefix length must be >= 1");
 
   /* Idempotent add: if a NAT44 pool with matching ext+internal ranges
    * already exists, treat this as a no-op success when mode matches,
@@ -1014,8 +1021,17 @@ sfw_nat_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
   pool.mode = mode;
   pool.port_range_start = 1024;
   pool.port_range_end = 65535;
-  pool.n_external_addrs = (external_plen < 32) ? (1u << (32 - external_plen)) : 1;
-  pool.n_internal_addrs = (internal_plen < 32) ? (1u << (32 - internal_plen)) : 1;
+  /* F2(api) defense in depth: explicit `>= 1` guard so a future
+   * caller that skips the upstream plen check above doesn't trigger
+   * `1u << 32` UB on plen == 0. */
+  pool.n_external_addrs =
+    (external_plen >= 1 && external_plen < 32)
+      ? (1u << (32 - external_plen))
+      : 1;
+  pool.n_internal_addrs =
+    (internal_plen >= 1 && internal_plen < 32)
+      ? (1u << (32 - internal_plen))
+      : 1;
 
   /* Compute ports_per_host for deterministic mode */
   u32 hosts_per_external = pool.n_internal_addrs / pool.n_external_addrs;
@@ -1094,6 +1110,10 @@ sfw_nat64_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (external_plen > 32)
     return clib_error_return (0, "external v4 prefix length %u > 32",
 			      external_plen);
+  if (external_plen < SFW_NAT_MIN_EXTERNAL_PLEN)
+    return clib_error_return (
+      0, "external v4 prefix length %u < %u (would size port allocator > 64K)",
+      external_plen, SFW_NAT_MIN_EXTERNAL_PLEN);
   if (!sfw_nat64_plen_valid (nat64_plen))
     return clib_error_return (
       0, "NAT64 prefix length must be one of {32,40,48,56,64,96}");
@@ -1130,8 +1150,11 @@ sfw_nat64_pool_command_fn (vlib_main_t *vm, unformat_input_t *input,
       pool.nat64_prefix_len = nat64_plen;
       pool.port_range_start = 1024;
       pool.port_range_end = 65535;
+      /* F2(api) defense in depth — see NAT44 path. */
       pool.n_external_addrs =
-	(external_plen < 32) ? (1u << (32 - external_plen)) : 1;
+	(external_plen >= 1 && external_plen < 32)
+	  ? (1u << (32 - external_plen))
+	  : 1;
       pool.n_internal_addrs = 0; /* unused for NAT64 */
 
       sfw_feature_init (sm);

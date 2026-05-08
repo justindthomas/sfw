@@ -103,7 +103,17 @@ sfw_v4_port_alloc_ref_or_create (sfw_main_t *sm, ip4_address_t *addr,
   pool_get_zero (sm->v4_port_allocs, a);
   a->external_addr = *addr;
   a->external_plen = plen;
-  a->n_external_addrs = (plen < 32) ? (1u << (32 - plen)) : 1;
+  /* F1+F2(api) defense in depth — ingress (sfw_api.c, sfw.c CLI)
+   * already rejects plen < SFW_NAT_MIN_EXTERNAL_PLEN. Bound the
+   * shift here too: the `>= 1` guard avoids the C11 §6.5.7p3 UB on
+   * plen == 0, and clamping plen up to SFW_NAT_MIN_EXTERNAL_PLEN
+   * caps n_external_addrs at 65536 so vec_validate at line 127
+   * can't be driven into an `os_panic()` allocation failure. */
+  u8 safe_plen = plen;
+  if (safe_plen < SFW_NAT_MIN_EXTERNAL_PLEN)
+    safe_plen = SFW_NAT_MIN_EXTERNAL_PLEN;
+  a->n_external_addrs =
+    (safe_plen >= 1 && safe_plen < 32) ? (1u << (32 - safe_plen)) : 1;
   a->port_range_start = port_range_start;
   a->port_range_end = port_range_end;
 

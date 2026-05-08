@@ -70,6 +70,16 @@ typedef enum
   SFW_POOL_KIND_NAT64 = 1,
 } sfw_pool_kind_t;
 
+/* Minimum external prefix length accepted at pool-add ingress. The
+ * shared v4 port allocator sizes per-thread bitmap-pointer vectors
+ * by `n_external_addrs = 1u << (32 - plen)`; with attacker-supplied
+ * (or operator-typo) plen of 1, that's 2^31 entries × 8 bytes × N
+ * threads ≈ 16 GB, and `vec_validate` calls `os_panic()` when the
+ * allocation fails — VPP aborts. Cap external_plen at /16 = 65536
+ * addresses, which covers any realistic NAT44/NAT64 deployment and
+ * keeps per-thread bitmap state under ~512 KB. */
+#define SFW_NAT_MIN_EXTERNAL_PLEN 16
+
 /* Shared port allocator for a v4 external address range.
  *
  * Two pools that use overlapping v4 external ranges (e.g. a NAT44

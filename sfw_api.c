@@ -316,6 +316,15 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
       rv = VNET_API_ERROR_INVALID_VALUE;
       goto done;
     }
+  /* F1(api): bound external pool size — see SFW_NAT_MIN_EXTERNAL_PLEN
+   * comment in sfw.h. Also bounds internal_plen ≥ 1 to close F2(api)'s
+   * `1u << 32` UB on plen == 0 in the n_internal_addrs computation
+   * below. */
+  if (ext_fp.fp_len < SFW_NAT_MIN_EXTERNAL_PLEN || int_fp.fp_len < 1)
+    {
+      rv = VNET_API_ERROR_INVALID_VALUE;
+      goto done;
+    }
 
   ip4_address_t ext_addr = ext_fp.fp_addr.ip4;
   u8 ext_plen = ext_fp.fp_len;
@@ -362,10 +371,16 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
       pool.table_id = pool_table_id;
       pool.port_range_start = 1024;
       pool.port_range_end = 65535;
+      /* F2(api): the `1u << (32 - plen)` shift is UB per C11 §6.5.7p3
+       * when plen == 0 (shift count = 32 = width of u32). The
+       * SFW_NAT_MIN_EXTERNAL_PLEN ingress check above (and the
+       * `int_plen < 1` reject) prevent plen == 0 from reaching here,
+       * but make the bound explicit in the expression too — defense
+       * in depth for any future ingress path that forgets to gate. */
       pool.n_external_addrs =
-	(ext_plen < 32) ? (1u << (32 - ext_plen)) : 1;
+	(ext_plen >= 1 && ext_plen < 32) ? (1u << (32 - ext_plen)) : 1;
       pool.n_internal_addrs =
-	(int_plen < 32) ? (1u << (32 - int_plen)) : 1;
+	(int_plen >= 1 && int_plen < 32) ? (1u << (32 - int_plen)) : 1;
 
       u32 hosts_per_external = pool.n_internal_addrs / pool.n_external_addrs;
       if (hosts_per_external == 0)
@@ -444,8 +459,11 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
       goto done;
     }
   if (ext_fp.fp_len > 32 ||
+      ext_fp.fp_len < SFW_NAT_MIN_EXTERNAL_PLEN ||
       !sfw_nat64_api_plen_valid ((u8) v6_fp.fp_len))
     {
+      /* F1(api): cap external pool size on the NAT64 path too —
+       * same allocator backs NAT44 and NAT64 ext ranges. */
       rv = VNET_API_ERROR_INVALID_VALUE;
       goto done;
     }
@@ -485,8 +503,9 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
       pool.table_id = pool_table_id;
       pool.port_range_start = 1024;
       pool.port_range_end = 65535;
+      /* F2(api) defense in depth — see NAT44 path above. */
       pool.n_external_addrs =
-	(ext_plen < 32) ? (1u << (32 - ext_plen)) : 1;
+	(ext_plen >= 1 && ext_plen < 32) ? (1u << (32 - ext_plen)) : 1;
 
       sfw_feature_init (sm);
       pool.v4_alloc_idx = sfw_v4_port_alloc_ref_or_create (
