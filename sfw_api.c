@@ -30,6 +30,8 @@ static void
 sfw_api_copy_fixed_string (char *buf, size_t buf_len, const void *wire,
 			   size_t wire_len)
 {
+  if (buf_len == 0)
+    return;
   size_t n = wire_len < buf_len - 1 ? wire_len : buf_len - 1;
   memset (buf, 0, buf_len);
   memcpy (buf, wire, n);
