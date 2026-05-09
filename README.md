@@ -498,18 +498,62 @@ invokes all registered callbacks. The sfw callback checks
 appends the 16-byte precomputed option via `vlib_buffer_add_data`
 and bumps the RA's payload length. Zero allocation on the hot path.
 
+### RDNSS Router Advertisements (RFC 8106)
+
+`sfw_rdnss.c` is the direct sibling of `sfw_pref64.c`: same
+`ip6_ra_extra_option_register` hook, same per-interface state in
+`sfw_if_config_t`, but emits the **RDNSS** option (type 25) instead
+of PREF64. RDNSS lets a router advertise one or more IPv6 recursive
+DNS server addresses inline in every RA, so v6-only clients learn
+their resolver without DHCPv6. Recent Linux, Android, iOS, macOS,
+and Windows all consume it.
+
+VPP only declares the RDNSS option-type code in an enum
+(`icmp46_packet.h`) — no builder, no API, no CLI — so sfw owns the
+full path: option assembly, per-interface state, RA-builder
+callback, CLI, and binary API.
+
+**Configuration**
+
+```
+sfw rdnss advertise <intf> servers <v6>[,<v6>]... [lifetime <s>]
+sfw rdnss disable <intf>
+```
+
+Up to `SFW_RDNSS_MAX` (4) servers per interface. `lifetime` is in
+seconds; default 600s. Per RFC 8106 §5.1 the lifetime should sit in
+`[MaxRtrAdvInterval, 2 × MaxRtrAdvInterval]`.
+
+**Android 15+ note** — Android enforces
+`net.ipv6.conf.<if>.accept_ra_min_lft` (default 180s) and silently
+drops RDNSS sections with shorter lifetimes (issuetracker
+#396995424). The 600s default is well clear of that floor; if you
+override, stay above 180s or v6-only-mostly Android clients will
+fail to resolve.
+
+**Callback flow** — `sfw_rdnss_init()` registers
+`sfw_rdnss_ra_option_cb` with the same hook PREF64 uses. The
+callback reads `ic->rdnss_option_bytes` (precomputed at config time
+— 8-byte header plus 16 bytes per server), appends it via
+`vlib_buffer_add_data`, and bumps `*payload_length`. No allocation
+on the hot path.
+
 ## File Structure
 
 | File | Purpose |
 |------|---------|
 | `sfw.h` | All data structures: session keys, sessions, rules, policies, zones, plugin main |
-| `sfw.c` | Plugin init, CLI commands (zone, policy, nat pool/static, show/clear), feature arc registration |
+| `sfw.c` | Plugin init, CLI commands (zone, policy, nat pool/static, nat64, pref64, rdnss, show/clear), feature arc registration |
 | `sfw_node.c` | Packet processing: sfw-ip4 / sfw-ip6 input nodes and sfw-ip4-out / sfw-ip6-out output nodes (two-pass design) |
 | `sfw_rules.c` | Rule matching: first-match evaluation with prefix/port/protocol/ICMP filtering |
 | `sfw_session.c` | Session lifecycle: create, remove (with dual hash cleanup), format for display |
 | `sfw_nat.c` | NAT44 pool management (deterministic and dynamic modes), static 1:1 / DNAT mappings, per-thread port bitmaps, address/port translation, incremental checksum updates |
 | `sfw_nat64.c` | NAT64 (RFC 6146): RFC 6052 prefix embed/extract, v6↔v4 packet translation (TCP/UDP inline, ICMP via core VPP `ip6_to_ip4.h` / `ip4_to_ip6.h` helpers), pool matching |
 | `sfw_pref64.c` | RFC 8781 PREF64 RA option: per-interface config, precomputed option bytes, callback registered via VPP's `ip6_ra_extra_option_register` (see `vpp-patches/`) |
+| `sfw_rdnss.c` | RFC 8106 RDNSS RA option: per-interface server list (up to 4 IPv6 resolvers), precomputed 8 + 16·N option bytes, registered via the same `ip6_ra_extra_option_register` hook as PREF64 |
 | `vpp-patches/` | Small patches against core VPP required by sfw, applied at container-build time. Currently: `0001-ip6-ra-extra-option-hook.patch` — adds the RA extra-option callback API. Upstream-bound |
-| `sfw.api` | Binary API definitions (policy/rule, NAT pool, NAT static, NAT64 pool, PREF64 advertise, zone and interface ops) |
+| `sfw.api` | Binary API definitions (policy/rule, NAT pool, NAT static, NAT64 pool, PREF64 advertise, RDNSS advertise, zone and interface ops) |
+| `sfw_api.c` | Binary API handlers — `vl_api_sfw_*_t_handler` entrypoints implementing the messages declared in `sfw.api` |
 | `sfw_test.c` | VAT test client for the binary API |
+| `fuzz/` | libFuzzer harnesses across four tiers: pure RFC-6052/wire-format helpers (this dir), full NAT64 translator dispatch (`sfw_full/`), packet-path node bodies (`sfw_node/`), binary-API handlers (`sfw_api/`). See `fuzz/README.md` |
+| `build.sh`, `Dockerfile`, `CMakeLists.txt` | Container-based VPP-plugin build. `build.sh` runs the build inside the `audit-tools:vpp` image after applying `vpp-patches/` |
