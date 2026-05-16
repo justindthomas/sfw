@@ -1473,6 +1473,178 @@ VLIB_CLI_COMMAND (sfw_show_rdnss_command, static) = {
   .function = sfw_show_rdnss_command_fn,
 };
 
+/* --- CLI: sfw dnr (RFC 9463 DNR RA option) ---
+ *
+ *   sfw dnr advertise <interface> adn <name> servers <v6>[,<v6>]...
+ *           [priority <n>] [lifetime <s>]
+ *   sfw dnr disable   <interface>
+ *   show sfw dnr
+ *
+ * Advertises an encrypted-DNS resolver (DoT) to SLAAC clients. The
+ * ADN must match a name on the resolver's TLS certificate; up to
+ * SFW_DNR_MAX (4) IPv6 addresses; priority defaults to 1; lifetime
+ * defaults to 600s. 'adn' must precede 'servers'. */
+
+static clib_error_t *
+sfw_dnr_command_fn (vlib_main_t *vm, unformat_input_t *input,
+		    vlib_cli_command_t *cmd)
+{
+  sfw_main_t *sm = &sfw_main;
+  vnet_main_t *vnm = sm->vnet_main;
+  u32 sw_if_index = ~0;
+  int is_add = 1;
+  ip6_address_t servers[SFW_DNR_MAX];
+  u32 n_servers = 0;
+  u32 priority = 0;
+  u32 lifetime = 0;
+  u8 *adn = 0;
+  clib_error_t *err = 0;
+
+  clib_memset (servers, 0, sizeof (servers));
+
+  if (unformat (input, "advertise"))
+    is_add = 1;
+  else if (unformat (input, "disable"))
+    is_add = 0;
+  else
+    return clib_error_return (0, "expected 'advertise' or 'disable'");
+
+  if (!unformat (input, "%U", unformat_vnet_sw_interface, vnm, &sw_if_index))
+    return clib_error_return (0, "expected <interface>");
+
+  if (is_add)
+    {
+      if (!unformat (input, "adn %s", &adn))
+	return clib_error_return (0, "expected 'adn <name>'");
+
+      if (!unformat (input, "servers"))
+	{
+	  err = clib_error_return (0, "expected 'servers <v6>[,<v6>]...'");
+	  goto out;
+	}
+      ip6_address_t one;
+      while (n_servers < SFW_DNR_MAX &&
+	     unformat (input, "%U", unformat_ip6_address, &one))
+	{
+	  clib_memcpy_fast (&servers[n_servers], &one, sizeof (one));
+	  n_servers++;
+	  if (!unformat (input, ","))
+	    break;
+	}
+      if (n_servers == 0)
+	{
+	  err = clib_error_return (0, "no valid IPv6 servers parsed");
+	  goto out;
+	}
+
+      (void) unformat (input, "priority %u", &priority);
+      (void) unformat (input, "lifetime %u", &lifetime);
+
+      /* unformat "%s" yields a non-NUL-terminated vec; terminate it
+       * before handing it over as a C string. */
+      vec_add1 (adn, 0);
+      if (sfw_dnr_enable (sm, sw_if_index, (char *) adn, servers,
+			  (u8) n_servers, (u16) priority, lifetime) != 0)
+	{
+	  err = clib_error_return (
+	    0, "sfw_dnr_enable failed (malformed ADN or too many servers)");
+	  goto out;
+	}
+      vlib_cli_output (vm, "DNR advertising resolver %s (%u address(es)) on %U",
+		       adn, n_servers, format_vnet_sw_if_index_name, vnm,
+		       sw_if_index);
+    }
+  else
+    {
+      sfw_dnr_disable (sm, sw_if_index);
+      vlib_cli_output (vm, "DNR disabled on %U",
+		       format_vnet_sw_if_index_name, vnm, sw_if_index);
+    }
+
+out:
+  vec_free (adn);
+  return err;
+}
+
+VLIB_CLI_COMMAND (sfw_dnr_command, static) = {
+  .path = "sfw dnr",
+  .short_help = "sfw dnr advertise <intf> adn <name> servers <v6>[,<v6>]... "
+		"[priority <n>] [lifetime <s>] | sfw dnr disable <intf>",
+  .function = sfw_dnr_command_fn,
+};
+
+static clib_error_t *
+sfw_show_dnr_command_fn (vlib_main_t *vm, unformat_input_t *input,
+			 vlib_cli_command_t *cmd)
+{
+  sfw_main_t *sm = &sfw_main;
+  vnet_main_t *vnm = sm->vnet_main;
+  u32 n = 0;
+
+  for (u32 i = 0; i < vec_len (sm->if_config); i++)
+    {
+      sfw_if_config_t *ic = &sm->if_config[i];
+      if (!ic->dnr_enabled)
+	continue;
+      n++;
+
+      /* Decode the precomputed option wire bytes for display.
+       * Layout: [2]=svcprio, [4]=lifetime, [8]=adnlen, [10]=ADN,
+       * [10+adnlen]=addrlen, then 16-byte addresses. Multi-byte
+       * reads go through memcpy — the ADN length shifts later
+       * fields off any natural alignment. */
+      u8 *b = ic->dnr_option_bytes;
+      u16 svcprio, adn_len, addr_len;
+      u32 lifetime;
+      clib_memcpy_fast (&svcprio, &b[2], 2);
+      clib_memcpy_fast (&lifetime, &b[4], 4);
+      clib_memcpy_fast (&adn_len, &b[8], 2);
+      svcprio = clib_net_to_host_u16 (svcprio);
+      lifetime = clib_net_to_host_u32 (lifetime);
+      adn_len = clib_net_to_host_u16 (adn_len);
+
+      /* DNS-wire ADN back to dotted text. */
+      u8 *adn = 0;
+      u16 p = 10;
+      while (p < (u16) (10 + adn_len) && b[p] != 0)
+	{
+	  u8 ll = b[p++];
+	  if (adn)
+	    vec_add1 (adn, '.');
+	  vec_add (adn, &b[p], ll);
+	  p += ll;
+	}
+      vec_add1 (adn, 0);
+
+      u16 ao = 10 + adn_len;
+      clib_memcpy_fast (&addr_len, &b[ao], 2);
+      addr_len = clib_net_to_host_u16 (addr_len);
+      ao += 2;
+
+      vlib_cli_output (vm,
+		       "  %U: adn %s, priority %u, lifetime %us, "
+		       "transport DoT",
+		       format_vnet_sw_if_index_name, vnm, i, adn,
+		       (u32) svcprio, lifetime);
+      for (u16 j = 0; j + 16 <= addr_len; j += 16)
+	{
+	  ip6_address_t addr;
+	  clib_memcpy_fast (&addr, &b[ao + j], 16);
+	  vlib_cli_output (vm, "    %U", format_ip6_address, &addr);
+	}
+      vec_free (adn);
+    }
+  if (n == 0)
+    vlib_cli_output (vm, "no interfaces advertising DNR");
+  return 0;
+}
+
+VLIB_CLI_COMMAND (sfw_show_dnr_command, static) = {
+  .path = "show sfw dnr",
+  .short_help = "show sfw dnr",
+  .function = sfw_show_dnr_command_fn,
+};
+
 /* --- CLI: sfw nat static --- */
 
 static clib_error_t *
@@ -1759,6 +1931,10 @@ sfw_init (vlib_main_t *vm)
   /* Same hook, separate callback — RDNSS (RFC 8106) RA option. No-op
    * on interfaces that haven't opted in via 'sfw rdnss advertise'. */
   sfw_rdnss_init ();
+
+  /* Same hook again — DNR (RFC 9463) RA option, advertising the
+   * encrypted (DoT) resolver. No-op until 'sfw dnr advertise'. */
+  sfw_dnr_init ();
 
   return 0;
 }

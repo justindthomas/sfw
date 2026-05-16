@@ -621,6 +621,59 @@ done:
   REPLY_MACRO (VL_API_SFW_RDNSS_ADVERTISE_ADD_DEL_REPLY);
 }
 
+/* --- sfw_dnr_advertise_add_del --- */
+
+static void
+vl_api_sfw_dnr_advertise_add_del_t_handler (
+  vl_api_sfw_dnr_advertise_add_del_t *mp)
+{
+  sfw_main_t *sm = &sfw_main;
+  vl_api_sfw_dnr_advertise_add_del_reply_t *rmp;
+  int rv = 0;
+  u32 sw_if_index = ntohl (mp->sw_if_index);
+
+  if (mp->is_add)
+    {
+      if (mp->n_servers == 0 || mp->n_servers > SFW_DNR_MAX)
+	{
+	  rv = VNET_API_ERROR_INVALID_VALUE;
+	  goto done;
+	}
+      ip6_address_t servers[SFW_DNR_MAX];
+      clib_memset (servers, 0, sizeof (servers));
+      for (u8 i = 0; i < mp->n_servers; i++)
+	clib_memcpy_fast (servers[i].as_u8, mp->servers[i], 16);
+
+      /* mp->adn is a fixed-size NUL-padded wire string; copy it into
+       * a zero-terminated C buffer. An empty ADN is rejected here;
+       * a malformed or over-long one is caught by sfw_dnr_enable. */
+      char adn[SFW_DNR_ADN_MAX + 1];
+      sfw_api_copy_fixed_string (adn, sizeof (adn), mp->adn,
+				 sizeof (mp->adn));
+      if (adn[0] == 0)
+	{
+	  rv = VNET_API_ERROR_INVALID_VALUE;
+	  goto done;
+	}
+
+      if (sfw_dnr_enable (sm, sw_if_index, adn, servers, mp->n_servers,
+			  ntohs (mp->service_priority),
+			  ntohl (mp->lifetime_sec)) != 0)
+	{
+	  rv = VNET_API_ERROR_INVALID_VALUE;
+	  goto done;
+	}
+    }
+  else
+    {
+      if (sfw_dnr_disable (sm, sw_if_index) != 0)
+	rv = VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+done:
+  REPLY_MACRO (VL_API_SFW_DNR_ADVERTISE_ADD_DEL_REPLY);
+}
+
 /* --- sfw_nat_static_add_del --- */
 
 static void

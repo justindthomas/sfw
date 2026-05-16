@@ -311,6 +311,16 @@ typedef struct
   u32 n_policies;	       /* refcount; slab freed when 0 */
 } sfw_zone_pair_slab_t;
 
+/* DNR (RFC 9463) RA-option sizing. ADN is bounded by the RFC 1035
+ * max domain-name wire length; addresses are capped so the option
+ * fits comfortably in one RA alongside PIO/MTU/SLLA/PREF64/RDNSS.
+ * SFW_DNR_OPTION_MAX is the worst case: 14 fixed header octets + ADN
+ * + 16*N addresses + 8 octets of DoT SvcParams + up to 7 octets of
+ * pad, rounded up. */
+#define SFW_DNR_MAX	   4
+#define SFW_DNR_ADN_MAX	   255
+#define SFW_DNR_OPTION_MAX 352
+
 /* Per-interface config, indexed by sw_if_index */
 typedef struct
 {
@@ -334,6 +344,18 @@ typedef struct
   u8 rdnss_count;
   u8 rdnss_option_len;
   u8 rdnss_option_bytes[8 + 16 * 4];
+
+  /* RFC 9463 DNR (Discovery of Network-designated Resolvers) RA
+   * option. When dnr_enabled, sfw's callback appends a type-144 DNR
+   * option to every RA on this interface, advertising an encrypted
+   * DNS resolver: an Authentication Domain Name, IPv6 address(es),
+   * and DoT SvcParams. dnr_option_bytes is the full wire format
+   * (including the trailing 8-octet pad) precomputed at config time;
+   * dnr_option_len is its length for the hot-path append. The option
+   * is variable-length, so unlike rdnss_option_len it needs u16. */
+  u8 dnr_enabled;
+  u16 dnr_option_len;
+  u8 dnr_option_bytes[SFW_DNR_OPTION_MAX];
 } sfw_if_config_t;
 
 #define SFW_RDNSS_MAX 4
@@ -717,6 +739,31 @@ int sfw_rdnss_enable (sfw_main_t *sm, u32 sw_if_index,
 		      const ip6_address_t *servers, u8 n_servers,
 		      u32 lifetime_sec);
 int sfw_rdnss_disable (sfw_main_t *sm, u32 sw_if_index);
+
+/* --- DNR Router Advertisement option (RFC 9463) ---
+ *
+ * Same ip6_ra_extra_option_register hook as PREF64/RDNSS. Emits a
+ * type-144 DNR option naming an encrypted-DNS resolver: its
+ * Authentication Domain Name (which the client validates against
+ * the resolver's TLS certificate), one or more IPv6 addresses, and
+ * SvcParams advertising DNS-over-TLS (ALPN "dot", RFC 9461). Active
+ * on interfaces where sfw_dnr_enable has been called. */
+
+void sfw_dnr_init (void);
+
+/* Enable DNR advertisement on an interface. adn is the resolver's
+ * Authentication Domain Name as a NUL-terminated string (e.g.
+ * "dns.jdt.dev"); it is encoded to DNS wire form internally.
+ * addrs/n_addr give the resolver's IPv6 address(es) (1..SFW_DNR_MAX).
+ * service_priority 0 is promoted to 1 (RFC 9460 reserves 0 for
+ * AliasMode). lifetime_sec == 0 selects sfw's default (600s);
+ * 0xFFFFFFFF means infinite. Returns 0 on success, -1 on bad
+ * arguments (n_addr out of range, ADN empty / malformed / too
+ * long). */
+int sfw_dnr_enable (sfw_main_t *sm, u32 sw_if_index, const char *adn,
+		    const ip6_address_t *addrs, u8 n_addr,
+		    u16 service_priority, u32 lifetime_sec);
+int sfw_dnr_disable (sfw_main_t *sm, u32 sw_if_index);
 
 format_function_t format_sfw_session;
 
