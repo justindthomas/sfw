@@ -7,14 +7,15 @@
  *
  * Same shape as sfw_rdnss.c / sfw_pref64.c: registers a callback
  * with VPP's ip6_ra_extra_option_register hook so every RA emitted
- * on an interface where sfw_dnr_enable has been called carries a
- * type-144 DNR option. Where RDNSS (RFC 8106) advertises a plaintext
- * Do53 resolver, DNR advertises an *encrypted* one: an Authentication
- * Domain Name the client validates against the resolver's TLS
- * certificate, the resolver's IPv6 address(es), and SvcParams naming
- * the transport. This build advertises DNS-over-TLS (ALPN "dot",
- * RFC 9461) — the port is omitted, so clients use the DoT default of
- * 853.
+ * on an interface where sfw_dnr_enable has been called carries the
+ * type-144 DNR option(s). Where RDNSS (RFC 8106) advertises a
+ * plaintext Do53 resolver, DNR advertises an *encrypted* one: an
+ * Authentication Domain Name the client validates against the
+ * resolver's TLS certificate, the resolver's IPv6 address(es), and
+ * SvcParams naming the transport. This build advertises the resolver
+ * over two transports — DNS-over-TLS (ALPN "dot", port 853 default)
+ * and DNS-over-HTTPS (ALPN "h2" + dohpath, port 443 default),
+ * RFC 9461 — as a pair of type-144 options in every RA.
  *
  * VPP has no native DNR support — no option-type enum, no builder,
  * no API. sfw owns the entire path via the ip6_ra extra-option
@@ -66,6 +67,21 @@ static const u8 sfw_dnr_svcparams_dot[8] = {
   0x00, 0x01, 0x00, 0x04, 0x03, 'd', 'o', 't',
 };
 
+/* Fixed SvcParams for DoH, RFC 9460 §2.2 wire format — two
+ * SvcParamKeys, ascending: "alpn" (key 1) with the single id "h2",
+ * then "dohpath" (key 7, RFC 9461 §5) carrying the URI Template
+ * "/dns-query{?dns}". RFC 9461 §5 requires dohpath whenever the ALPN
+ * indicates HTTP. The "port" SvcParam is omitted — 443 is the DoH
+ * default. 27 octets total:
+ *   00 01 00 03 02 68 32                  alpn  = ["h2"]
+ *   00 07 00 10 2f..7d                    dohpath = "/dns-query{?dns}"
+ *                                         (key 7, 16-octet value)    */
+static const u8 sfw_dnr_svcparams_doh[27] = {
+  0x00, 0x01, 0x00, 0x03, 0x02, 'h', '2',
+  0x00, 0x07, 0x00, 0x10, '/', 'd', 'n', 's', '-', 'q', 'u', 'e',
+  'r', 'y', '{', '?', 'd', 'n', 's', '}',
+};
+
 /* Encode a textual domain name into uncompressed DNS wire format
  * (RFC 1035 §3.1): each label prefixed by its length octet, the
  * whole name terminated by a zero (root) octet. A single trailing
@@ -104,13 +120,16 @@ sfw_dnr_encode_adn (const char *adn, u8 *out)
   return w;
 }
 
-/* Build the full DNR option (including the trailing pad) into out,
- * which must be at least SFW_DNR_OPTION_MAX bytes. Returns 0 on
- * success with *out_len set, or -1 on bad arguments. */
+/* Build one full DNR option (including the trailing pad) into out,
+ * which must be at least SFW_DNR_OPTION_MAX bytes. svcparams/svc_len
+ * give the transport-specific SvcParams block (DoT or DoH) appended
+ * verbatim. Returns 0 on success with *out_len set, or -1 on bad
+ * arguments. */
 static int
 sfw_dnr_build_option (u8 *out, u16 *out_len, const char *adn,
 		      u16 service_priority, u32 lifetime_sec,
-		      const ip6_address_t *addrs, u8 n_addr)
+		      const ip6_address_t *addrs, u8 n_addr,
+		      const u8 *svcparams, u16 svc_len)
 {
   if (n_addr == 0 || n_addr > SFW_DNR_MAX)
     return -1;
@@ -121,7 +140,6 @@ sfw_dnr_build_option (u8 *out, u16 *out_len, const char *adn,
     return -1;
 
   u16 addr_len = (u16) n_addr * 16;
-  u16 svc_len = (u16) sizeof (sfw_dnr_svcparams_dot);
 
   /* Option length before the 8-octet pad: type+len(2) + svcprio(2) +
    * lifetime(4) + adnlen(2) + ADN + addrlen(2) + addresses +
@@ -166,7 +184,7 @@ sfw_dnr_build_option (u8 *out, u16 *out_len, const char *adn,
   u16 sl = clib_host_to_net_u16 (svc_len);
   clib_memcpy_fast (&out[o], &sl, 2);
   o += 2;
-  clib_memcpy_fast (&out[o], sfw_dnr_svcparams_dot, svc_len);
+  clib_memcpy_fast (&out[o], svcparams, svc_len);
   o += svc_len;
 
   while (o < padded) /* zero-pad to the 8-octet boundary */
@@ -213,13 +231,27 @@ sfw_dnr_enable (sfw_main_t *sm, u32 sw_if_index, const char *adn,
    * floor Android 15+ enforces. 0xFFFFFFFF means infinite. */
   u32 lt = lifetime_sec ? lifetime_sec : 600;
 
-  /* Build into a scratch buffer first so a malformed ADN or
-   * oversized option leaves any existing config untouched. */
-  u8 buf[SFW_DNR_OPTION_MAX];
-  u16 len = 0;
-  if (sfw_dnr_build_option (buf, &len, adn, service_priority, lt, addrs,
-			    n_addr) != 0)
+  /* Build both options into a scratch buffer first so a malformed
+   * ADN or oversized option leaves any existing config untouched.
+   * One DoT option followed by one DoH option — ND options are
+   * self-delimiting via their length field, so the callback appends
+   * the concatenation as a single blob. */
+  u8 buf[SFW_DNR_BUF_MAX];
+  u16 dot_len = 0, doh_len = 0;
+  if (sfw_dnr_build_option (buf, &dot_len, adn, service_priority, lt,
+			    addrs, n_addr, sfw_dnr_svcparams_dot,
+			    sizeof (sfw_dnr_svcparams_dot)) != 0)
     return -1;
+  /* DoH at Service Priority + 1: a DoT-capable client prefers the
+   * lower priority (DoT carries no HTTP request metadata); a
+   * DoH-only client (Windows) falls to the DoH option. */
+  u16 doh_prio =
+    service_priority < 0xFFFF ? service_priority + 1 : service_priority;
+  if (sfw_dnr_build_option (buf + dot_len, &doh_len, adn, doh_prio, lt,
+			    addrs, n_addr, sfw_dnr_svcparams_doh,
+			    sizeof (sfw_dnr_svcparams_doh)) != 0)
+    return -1;
+  u16 len = dot_len + doh_len;
 
   vec_validate (sm->if_config, sw_if_index);
   sfw_if_config_t *ic = &sm->if_config[sw_if_index];

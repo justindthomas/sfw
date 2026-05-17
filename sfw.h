@@ -314,12 +314,15 @@ typedef struct
 /* DNR (RFC 9463) RA-option sizing. ADN is bounded by the RFC 1035
  * max domain-name wire length; addresses are capped so the option
  * fits comfortably in one RA alongside PIO/MTU/SLLA/PREF64/RDNSS.
- * SFW_DNR_OPTION_MAX is the worst case: 14 fixed header octets + ADN
- * + 16*N addresses + 8 octets of DoT SvcParams + up to 7 octets of
- * pad, rounded up. */
+ * SFW_DNR_OPTION_MAX is the worst case for a single option: 14 fixed
+ * header octets + ADN + 16*N addresses + 27 octets of DoH SvcParams
+ * (the larger of the two SvcParam blocks) + up to 7 octets of pad,
+ * rounded up. SFW_DNR_BUF_MAX holds the DoT + DoH options
+ * concatenated — sfw advertises one of each per resolver. */
 #define SFW_DNR_MAX	   4
 #define SFW_DNR_ADN_MAX	   255
-#define SFW_DNR_OPTION_MAX 352
+#define SFW_DNR_OPTION_MAX 360
+#define SFW_DNR_BUF_MAX	   (2 * SFW_DNR_OPTION_MAX)
 
 /* Per-interface config, indexed by sw_if_index */
 typedef struct
@@ -346,16 +349,19 @@ typedef struct
   u8 rdnss_option_bytes[8 + 16 * 4];
 
   /* RFC 9463 DNR (Discovery of Network-designated Resolvers) RA
-   * option. When dnr_enabled, sfw's callback appends a type-144 DNR
-   * option to every RA on this interface, advertising an encrypted
-   * DNS resolver: an Authentication Domain Name, IPv6 address(es),
-   * and DoT SvcParams. dnr_option_bytes is the full wire format
-   * (including the trailing 8-octet pad) precomputed at config time;
-   * dnr_option_len is its length for the hot-path append. The option
-   * is variable-length, so unlike rdnss_option_len it needs u16. */
+   * option. When dnr_enabled, sfw's callback appends a pair of
+   * type-144 DNR options to every RA on this interface, advertising
+   * the same encrypted DNS resolver (Authentication Domain Name +
+   * IPv6 address(es)) over two transports: one DoT option and one
+   * DoH option, distinguished by their SvcParams. dnr_option_bytes
+   * is the full wire format of both options concatenated (each with
+   * its trailing 8-octet pad) precomputed at config time;
+   * dnr_option_len is the combined length for the hot-path append.
+   * The options are variable-length, so unlike rdnss_option_len this
+   * needs u16. */
   u8 dnr_enabled;
   u16 dnr_option_len;
-  u8 dnr_option_bytes[SFW_DNR_OPTION_MAX];
+  u8 dnr_option_bytes[SFW_DNR_BUF_MAX];
 } sfw_if_config_t;
 
 #define SFW_RDNSS_MAX 4

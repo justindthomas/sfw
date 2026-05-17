@@ -1588,51 +1588,89 @@ sfw_show_dnr_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	continue;
       n++;
 
-      /* Decode the precomputed option wire bytes for display.
-       * Layout: [2]=svcprio, [4]=lifetime, [8]=adnlen, [10]=ADN,
-       * [10+adnlen]=addrlen, then 16-byte addresses. Multi-byte
-       * reads go through memcpy — the ADN length shifts later
-       * fields off any natural alignment. */
+      /* dnr_option_bytes holds the DoT and DoH options
+       * concatenated; walk them by the ND option length field
+       * (octet [1], in 8-octet units). Per option, layout is:
+       * [2]=svcprio, [4]=lifetime, [8]=adnlen, [10]=ADN,
+       * [10+adnlen]=addrlen, then 16-byte addresses, then
+       * [2]=svcparamslen and the SvcParams block. Multi-byte reads
+       * go through memcpy — the ADN length shifts later fields off
+       * any natural alignment. */
       u8 *b = ic->dnr_option_bytes;
-      u16 svcprio, adn_len, addr_len;
-      u32 lifetime;
-      clib_memcpy_fast (&svcprio, &b[2], 2);
-      clib_memcpy_fast (&lifetime, &b[4], 4);
-      clib_memcpy_fast (&adn_len, &b[8], 2);
-      svcprio = clib_net_to_host_u16 (svcprio);
-      lifetime = clib_net_to_host_u32 (lifetime);
-      adn_len = clib_net_to_host_u16 (adn_len);
-
-      /* DNS-wire ADN back to dotted text. */
-      u8 *adn = 0;
-      u16 p = 10;
-      while (p < (u16) (10 + adn_len) && b[p] != 0)
+      u16 off = 0;
+      while (off + 2 <= ic->dnr_option_len)
 	{
-	  u8 ll = b[p++];
-	  if (adn)
-	    vec_add1 (adn, '.');
-	  vec_add (adn, &b[p], ll);
-	  p += ll;
-	}
-      vec_add1 (adn, 0);
+	  u8 *o = &b[off];
+	  u16 opt_len = (u16) o[1] * 8;
+	  if (opt_len == 0 || off + opt_len > ic->dnr_option_len)
+	    break;
 
-      u16 ao = 10 + adn_len;
-      clib_memcpy_fast (&addr_len, &b[ao], 2);
-      addr_len = clib_net_to_host_u16 (addr_len);
-      ao += 2;
+	  u16 svcprio, adn_len, addr_len;
+	  u32 lifetime;
+	  clib_memcpy_fast (&svcprio, &o[2], 2);
+	  clib_memcpy_fast (&lifetime, &o[4], 4);
+	  clib_memcpy_fast (&adn_len, &o[8], 2);
+	  svcprio = clib_net_to_host_u16 (svcprio);
+	  lifetime = clib_net_to_host_u32 (lifetime);
+	  adn_len = clib_net_to_host_u16 (adn_len);
 
-      vlib_cli_output (vm,
-		       "  %U: adn %s, priority %u, lifetime %us, "
-		       "transport DoT",
-		       format_vnet_sw_if_index_name, vnm, i, adn,
-		       (u32) svcprio, lifetime);
-      for (u16 j = 0; j + 16 <= addr_len; j += 16)
-	{
-	  ip6_address_t addr;
-	  clib_memcpy_fast (&addr, &b[ao + j], 16);
-	  vlib_cli_output (vm, "    %U", format_ip6_address, &addr);
+	  /* DNS-wire ADN back to dotted text. */
+	  u8 *adn = 0;
+	  u16 p = 10;
+	  while (p < (u16) (10 + adn_len) && o[p] != 0)
+	    {
+	      u8 ll = o[p++];
+	      if (adn)
+		vec_add1 (adn, '.');
+	      vec_add (adn, &o[p], ll);
+	      p += ll;
+	    }
+	  vec_add1 (adn, 0);
+
+	  u16 ao = 10 + adn_len;
+	  clib_memcpy_fast (&addr_len, &o[ao], 2);
+	  addr_len = clib_net_to_host_u16 (addr_len);
+	  ao += 2;
+
+	  /* SvcParams follow the addresses: o[so..so+2]=svcparamslen,
+	   * then the block. The first SvcParam is alpn: key at
+	   * o[so+2..so+4] (= 00 01), value length at o[so+4..so+6],
+	   * the ALPN id list at o[so+6..]. An "h2" id marks the DoH
+	   * option, otherwise it is DoT. */
+	  const char *transport = "DoT";
+	  u16 so = ao + addr_len;
+	  if (so + 6 <= opt_len && o[so + 2] == 0 && o[so + 3] == 1)
+	    {
+	      u16 al;
+	      clib_memcpy_fast (&al, &o[so + 4], 2);
+	      al = clib_net_to_host_u16 (al);
+	      u16 q = so + 6;
+	      while (q + 1 <= so + 6 + al && q < opt_len)
+		{
+		  u8 idl = o[q++];
+		  if (idl == 2 && o[q] == 'h' && o[q + 1] == '2')
+		    {
+		      transport = "DoH";
+		      break;
+		    }
+		  q += idl;
+		}
+	    }
+
+	  vlib_cli_output (vm,
+			   "  %U: adn %s, priority %u, lifetime %us, "
+			   "transport %s",
+			   format_vnet_sw_if_index_name, vnm, i, adn,
+			   (u32) svcprio, lifetime, transport);
+	  for (u16 j = 0; j + 16 <= addr_len; j += 16)
+	    {
+	      ip6_address_t addr;
+	      clib_memcpy_fast (&addr, &o[ao + j], 16);
+	      vlib_cli_output (vm, "    %U", format_ip6_address, &addr);
+	    }
+	  vec_free (adn);
+	  off += opt_len;
 	}
-      vec_free (adn);
     }
   if (n == 0)
     vlib_cli_output (vm, "no interfaces advertising DNR");
