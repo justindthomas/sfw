@@ -10,6 +10,9 @@
 #include <vnet/interface.h>
 #include <vnet/ip/ip_types_api.h>
 #include <vnet/fib/fib_types.h>
+#include <vnet/fib/fib_table.h>
+#include <vnet/fib/fib_entry.h>
+#include <vnet/arp/arp.h>
 
 #include <vlibapi/api.h>
 #include <vlibmemory/api.h>
@@ -294,6 +297,59 @@ sfw_nat_pool_free_internals (sfw_main_t *sm, sfw_nat_pool_t *pool)
   sfw_v4_port_alloc_unref (sm, pool->v4_alloc_idx);
 }
 
+/* Register (is_add) or remove proxy-ARP for a NAT pool's external range so
+ * the upstream peer can ARP-resolve a SNATed source and its reply reaches
+ * us. Only needed when the external range sits inside a connected subnet
+ * (the peer is on-link and ARPs for the address directly); a routed pool
+ * reaches the router without ARP, so we detect the absence of a covering
+ * attached route and skip. Mirrors what VPP's own nat44 does for its
+ * address pool — without it, an in-subnet pool creates the SNAT session
+ * but the return packet is undeliverable (the peer's ARP goes unanswered).
+ * Leaving proxy-ARP enabled on the interface after a delete is harmless:
+ * with no ranges registered it answers nothing, and another pool sharing
+ * the interface may still need it. */
+static void
+sfw_nat_pool_proxy_arp (const ip4_address_t *ext_addr, u8 ext_plen,
+			u32 table_id, int is_add)
+{
+  u32 fib_index = fib_table_find (FIB_PROTOCOL_IP4, table_id);
+  if (fib_index == (u32) ~0)
+    return;
+
+  /* [lo, hi] = network .. broadcast of ext_addr/ext_plen. */
+  u32 host = clib_net_to_host_u32 (ext_addr->as_u32);
+  u32 mask = (ext_plen == 0) ? 0 : (~0u << (32 - ext_plen));
+  ip4_address_t lo, hi;
+  lo.as_u32 = clib_host_to_net_u32 (host & mask);
+  hi.as_u32 = clib_host_to_net_u32 ((host & mask) | ~mask);
+
+  /* Find the covering route; proxy-ARP only applies when the pool sits on
+   * a connected/attached subnet of a real interface. */
+  fib_prefix_t pfx = {
+    .fp_proto = FIB_PROTOCOL_IP4,
+    .fp_len = 32,
+    .fp_addr.ip4 = *ext_addr,
+  };
+  fib_node_index_t fei = fib_table_lookup (fib_index, &pfx);
+  if (fei == FIB_NODE_INDEX_INVALID)
+    return;
+  if (!(fib_entry_get_flags (fei) & FIB_ENTRY_FLAG_ATTACHED))
+    return;
+  u32 sw_if_index = fib_entry_get_resolving_interface (fei);
+  if (sw_if_index == (u32) ~0)
+    return;
+
+  if (is_add)
+    {
+      arp_proxy_add (fib_index, &lo, &hi);
+      arp_proxy_enable (sw_if_index);
+    }
+  else
+    {
+      arp_proxy_del (fib_index, &lo, &hi);
+    }
+}
+
 static void
 vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 {
@@ -400,6 +456,10 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 	pool.port_range_end);
 
       vec_add1 (sm->nat_pools, pool);
+
+      /* Answer ARP for the external range so return traffic to a SNATed
+       * source can reach us (no-op for routed pools). */
+      sfw_nat_pool_proxy_arp (&ext_addr, ext_plen, pool_table_id, 1);
     }
   else
     {
@@ -417,6 +477,8 @@ vl_api_sfw_nat_pool_add_del_t_handler (vl_api_sfw_nat_pool_add_del_t *mp)
 	      p->internal_plen == int_plen &&
 	      p->table_id == pool_table_id)
 	    {
+	      /* Retract the proxy-ARP we registered for this range. */
+	      sfw_nat_pool_proxy_arp (&ext_addr, ext_plen, pool_table_id, 0);
 	      sfw_nat_pool_free_internals (sm, p);
 	      vec_delete (sm->nat_pools, 1, i);
 	      matched = 1;
@@ -513,6 +575,10 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
 	pool.port_range_end);
 
       vec_add1 (sm->nat_pools, pool);
+
+      /* Answer ARP for the v4 external range (NAT64 SNATs through it,
+       * same as NAT44) so return traffic reaches us; no-op if routed. */
+      sfw_nat_pool_proxy_arp (&ext_addr, ext_plen, pool_table_id, 1);
     }
   else
     {
@@ -529,6 +595,8 @@ vl_api_sfw_nat64_pool_add_del_t_handler (
 	      clib_memcmp (&p->nat64_prefix, &v6_prefix,
 			   sizeof (ip6_address_t)) == 0)
 	    {
+	      /* Retract the proxy-ARP we registered for the v4 external. */
+	      sfw_nat_pool_proxy_arp (&ext_addr, ext_plen, pool_table_id, 0);
 	      sfw_nat_pool_free_internals (sm, p);
 	      vec_delete (sm->nat_pools, 1, i);
 	      matched = 1;
@@ -710,7 +778,24 @@ vl_api_sfw_nat_static_add_del_t_handler (
       mapping.internal_port = int_port;
       mapping.protocol = mp->protocol;
       mapping.table_id = static_table_id;
+
+      /* Proxy-ARP the external (DNAT) address so inbound traffic on a
+       * connected subnet can ARP-resolve it (no-op for a routed external).
+       * Refcounted by external address: port-forwards commonly share one
+       * external IP across ports/protocols, so register only for the first
+       * mapping on that address. */
+      int ext_first = 1;
+      u32 j;
+      for (j = 0; j < vec_len (sm->nat_statics); j++)
+	if (sm->nat_statics[j].external_addr.as_u32 == ext_addr.as_u32 &&
+	    sm->nat_statics[j].table_id == static_table_id)
+	  {
+	    ext_first = 0;
+	    break;
+	  }
       vec_add1 (sm->nat_statics, mapping);
+      if (ext_first)
+	sfw_nat_pool_proxy_arp (&ext_addr, 32, static_table_id, 1);
     }
   else
     {
@@ -726,6 +811,19 @@ vl_api_sfw_nat_static_add_del_t_handler (
 	    {
 	      vec_delete (sm->nat_statics, 1, i);
 	      matched = 1;
+	      /* Retract proxy-ARP only when no remaining mapping uses this
+	       * external address (another port-forward may still need it). */
+	      u32 j;
+	      int ext_still = 0;
+	      for (j = 0; j < vec_len (sm->nat_statics); j++)
+		if (sm->nat_statics[j].external_addr.as_u32 == ext_addr.as_u32 &&
+		    sm->nat_statics[j].table_id == static_table_id)
+		  {
+		    ext_still = 1;
+		    break;
+		  }
+	      if (!ext_still)
+		sfw_nat_pool_proxy_arp (&ext_addr, 32, static_table_id, 0);
 	      break;
 	    }
 	}
