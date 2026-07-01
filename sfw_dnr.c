@@ -114,6 +114,17 @@ sfw_dnr_encode_adn (const char *adn, u8 *out)
 	p++;
     }
 
+  /* If the loop stopped on a '.', we advanced past a separator onto
+   * another one — an empty interior label ("a..b"). The label_len==0
+   * guard above can't catch this because the outer loop bails on the
+   * dot before the empty label is ever measured; without this check
+   * the name is silently truncated at the first empty label (e.g.
+   * "dns..example.com" would advertise "dns"), so the DNR RA option
+   * carries an ADN the client then can't match against the resolver's
+   * TLS certificate (RFC 9463 6.2). Reject instead. */
+  if (*p == '.')
+    return 0;
+
   if (w == 0)
     return 0; /* name was empty or just "." */
   out[w++] = 0; /* terminating root label */
